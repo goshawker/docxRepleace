@@ -33,6 +33,10 @@ enum ReplaceCoordinator {
                 next += 1
             }
             while let (index, result) = await group.next() {
+                if Task.isCancelled {
+                    group.cancelAll()
+                    break
+                }
                 collected[index] = result
                 completed += 1
                 onProgress(ScanProgress(completed: completed, total: total))
@@ -76,10 +80,19 @@ enum ReplaceCoordinator {
             onProgress(ReplaceProgress(completed: index, total: total, currentPath: item.relativePath))
             do {
                 let data = try Data(contentsOf: item.url)
+                // .atomic 写入是「写临时文件再改名」，只要目录可写就能覆盖只读文件，
+                // 所以必须自己检查目标文件是否可写，并跳过
+                guard FileManager.default.isWritableFile(atPath: item.url.path) else {
+                    report.failed.append(ReportedFile(path: item.relativePath, reason: "文件不可写，已跳过"))
+                    continue
+                }
                 let (newData, count) = try DocxTextReplacer.replace(docxData: data, find: find,
                                                                     replaceWith: replaceWith,
                                                                     options: options)
-                guard count > 0 else { continue }
+                guard count > 0 else {
+                    report.skipped.append(ReportedFile(path: item.relativePath, reason: "磁盘内容已无匹配"))
+                    continue
+                }
                 if let runDirectory {
                     do {
                         try BackupManager.backup(fileURL: item.url, sourceFolder: sourceFolder,

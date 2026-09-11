@@ -110,4 +110,27 @@ final class ReplaceCoordinatorTests: XCTestCase {
                                                       backupRoot: root.appendingPathComponent("备份")) { _ in }
         XCTAssertEqual(report.modifiedFiles, 1, "坏文件不应影响其他文件")
     }
+
+    func testReadOnlyFileIsSkippedAndReported() async throws {
+        let file = root.appendingPathComponent("只读.docx")
+        try DocxFixture.docx(bodyXML: DocxFixture.paragraph(["旧名"])).write(to: file)
+        try FileManager.default.setAttributes([.posixPermissions: 0o444], ofItemAtPath: file.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: file.path) }
+
+        let results = await ReplaceCoordinator.scan(folder: root, find: "旧名",
+                                                    options: ReplaceOptions()) { _ in }
+        let items = results.filter { $0.matchCount > 0 }.map(\.item)
+        let report = await ReplaceCoordinator.replace(items: items, sourceFolder: root,
+                                                      find: "旧名", replaceWith: "新名",
+                                                      options: ReplaceOptions(), backupEnabled: true,
+                                                      backupRoot: root.appendingPathComponent("备份")) { _ in }
+        let readOnlyReport = report.failed.first { $0.path == "只读.docx" }
+        XCTAssertNotNil(readOnlyReport, "只读文件必须出现在失败列表中")
+        XCTAssertTrue(readOnlyReport?.reason.contains("不可写") ?? false)
+
+        // 内容必须原封不动
+        let data = try Data(contentsOf: file)
+        XCTAssertEqual(try DocxTextReplacer.countMatches(docxData: data, find: "旧名",
+                                                         options: ReplaceOptions()), 1)
+    }
 }

@@ -35,6 +35,7 @@ struct ContentView: View {
                     .foregroundStyle(model.folderURL == nil ? .secondary : .primary)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 Button("选择…") { model.chooseFolder() }
+                    .disabled(model.isBusy)
             }
             HStack {
                 Text("查找").frame(width: 56, alignment: .trailing)
@@ -100,7 +101,9 @@ struct ContentView: View {
             HStack {
                 Text(model.statusText).font(.callout).lineLimit(2)
                 Spacer()
-                if model.backupDirectory != nil {
+                if let backup = model.backupDirectory {
+                    Text(backup.path).font(.caption).foregroundStyle(.secondary)
+                        .lineLimit(1).truncationMode(.middle)
                     Button("打开备份文件夹") { model.openBackupFolder() }
                 }
                 if model.folderURL != nil {

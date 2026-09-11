@@ -27,6 +27,7 @@ final class AppViewModel: ObservableObject {
     @Published var showReplaceConfirmation = false
 
     private var runningTask: Task<Void, Never>?
+    private var scannedFolder: URL?
 
     var options: ReplaceOptions {
         ReplaceOptions(caseSensitive: caseSensitive, wholeWord: wholeWord)
@@ -73,9 +74,13 @@ final class AppViewModel: ObservableObject {
         panel.prompt = "选择"
         panel.message = "选择要处理的文件夹"
         guard panel.runModal() == .OK, let url = panel.url else { return }
+        runningTask?.cancel()
         folderURL = url
+        scannedFolder = nil
         results = []
         phase = .idle
+        progress = 0
+        currentFile = ""
         statusText = "已选择：\(url.path)"
     }
 
@@ -95,8 +100,17 @@ final class AppViewModel: ObservableObject {
                     self.statusText = "正在扫描 \(p.completed)/\(p.total)…"
                 }
             }
-            guard let self, !Task.isCancelled else { return }
+            guard let self else { return }
+            guard !Task.isCancelled else {
+                // 取消后必须复位，否则界面会永远卡在「扫描中」
+                self.phase = .idle
+                self.progress = 0
+                self.statusText = "已取消扫描"
+                return
+            }
+            guard self.folderURL == folder else { return }   // 期间换过文件夹，丢弃这批结果
             self.results = results
+            self.scannedFolder = folder
             self.phase = .scanned
             let matched = self.matchedItems.count
             self.progress = 1
@@ -116,7 +130,7 @@ final class AppViewModel: ObservableObject {
     }
 
     func confirmReplace() {
-        guard let folder = folderURL else { return }
+        guard let folder = scannedFolder else { return }
         let find = findText
         let replaceWith = replaceText
         let options = self.options
@@ -144,16 +158,16 @@ final class AppViewModel: ObservableObject {
             self.phase = .finished
             self.progress = 1
             self.currentFile = ""
-            if report.modifiedFiles == 0, let firstFailure = report.failed.first {
-                // 典型情形：备份目录建不了或全部文件失败，必须显式告知
-                self.alertMessage = firstFailure.reason
-                self.statusText = "未修改任何文件"
-            } else {
-                var summary = report.cancelled ? "已取消。" : ""
-                summary += "完成：修改 \(report.modifiedFiles) 个文件，共替换 \(report.replacedCount) 处"
-                if !report.failed.isEmpty { summary += "；\(report.failed.count) 个文件失败" }
-                self.statusText = summary
+            if !report.failed.isEmpty {
+                let shown = report.failed.prefix(5).map { "\($0.path)：\($0.reason)" }.joined(separator: "\n")
+                let more = report.failed.count > 5 ? "\n…另有 \(report.failed.count - 5) 个" : ""
+                self.alertMessage = "\(report.failed.count) 个文件未处理：\n\(shown)\(more)"
             }
+            var summary = report.cancelled ? "已取消。" : ""
+            summary += "完成：修改 \(report.modifiedFiles) 个文件，共替换 \(report.replacedCount) 处"
+            if !report.failed.isEmpty { summary += "；\(report.failed.count) 个文件失败" }
+            if !report.skipped.isEmpty { summary += "；\(report.skipped.count) 个文件已无匹配" }
+            self.statusText = summary
             self.rescanAfterReplace()
         }
     }
@@ -163,12 +177,18 @@ final class AppViewModel: ObservableObject {
     }
 
     private func rescanAfterReplace() {
-        guard let folder = folderURL else { return }
+        guard let folder = scannedFolder else { return }
         let find = findText
         let options = self.options
+        phase = .scanning
         runningTask = Task { [weak self] in
             let results = await ReplaceCoordinator.scan(folder: folder, find: find, options: options) { _ in }
             guard let self else { return }
+            guard !Task.isCancelled else {
+                // 这里也要复位，否则在「扫描中」取消会再次卡死界面
+                self.phase = .finished
+                return
+            }
             self.results = results
             self.phase = .finished
         }
