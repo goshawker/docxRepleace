@@ -137,7 +137,7 @@ struct DocxReplaceApp: App {
 
 - [ ] **Step 4: 写临时的 `DocxReplace/ContentView.swift`**
 
-（Task 13 会替换成真正的界面，这里只要能编译。）
+（Task 14 会替换成真正的界面，这里只要能编译。）
 
 ```swift
 import SwiftUI
