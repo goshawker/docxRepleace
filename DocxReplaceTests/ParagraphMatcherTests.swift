@@ -45,4 +45,71 @@ final class ParagraphMatcherTests: XCTestCase {
         let texts = ["公司", "名称", "是", "北京", "公司"]
         XCTAssertEqual(ParagraphMatcher.countMatches(in: texts, find: "公司", options: options), 2)
     }
+
+    func testReplaceWithinSingleRun() {
+        let edits = ParagraphMatcher.replace(in: ["北京公司"], find: "北京", replaceWith: "上海", options: options)
+        XCTAssertEqual(edits, [ParagraphMatcher.Edit(textIndex: 0, newText: "上海公司")])
+    }
+
+    func testReplaceAcrossRunsPutsTextInFirstRun() {
+        let edits = ParagraphMatcher.replace(in: ["北", "京", "公司"], find: "北京", replaceWith: "上海",
+                                             options: options)
+        XCTAssertEqual(edits, [
+            ParagraphMatcher.Edit(textIndex: 0, newText: "上海"),
+            ParagraphMatcher.Edit(textIndex: 1, newText: ""),
+        ])
+    }
+
+    func testReplaceAcrossRunsKeepsSuffix() {
+        let edits = ParagraphMatcher.replace(in: ["AB", "CD", "EF"], find: "BC", replaceWith: "X",
+                                             options: options)
+        XCTAssertEqual(edits, [
+            ParagraphMatcher.Edit(textIndex: 0, newText: "AX"),
+            ParagraphMatcher.Edit(textIndex: 1, newText: "D"),
+        ])
+    }
+
+    func testReplaceWithLongerText() {
+        let edits = ParagraphMatcher.replace(in: ["abc"], find: "b", replaceWith: "BETA", options: options)
+        XCTAssertEqual(edits, [ParagraphMatcher.Edit(textIndex: 0, newText: "aBETAc")])
+    }
+
+    func testReplaceWithEmptyStringDeletes() {
+        let edits = ParagraphMatcher.replace(in: ["aXbXc"], find: "X", replaceWith: "", options: options)
+        XCTAssertEqual(edits, [ParagraphMatcher.Edit(textIndex: 0, newText: "abc")])
+    }
+
+    func testReplaceMultipleMatchesInOneRun() {
+        let edits = ParagraphMatcher.replace(in: ["old-old"], find: "old", replaceWith: "new", options: options)
+        XCTAssertEqual(edits, [ParagraphMatcher.Edit(textIndex: 0, newText: "new-new")])
+    }
+
+    func testReplaceMatchSpanningTwoRunsEditsBoth() {
+        // joined = "abab"，"ba" 命中 [1,3)，横跨 run0 的 'b' 与 run1 的 'a'，
+        // 因此两个 run 都必须重写（run1 若不动，残留的 'a' 会留下）
+        let edits = ParagraphMatcher.replace(in: ["ab", "ab"], find: "ba", replaceWith: "X", options: options)
+        XCTAssertEqual(edits, [ParagraphMatcher.Edit(textIndex: 0, newText: "aX"),
+                               ParagraphMatcher.Edit(textIndex: 1, newText: "b")])
+    }
+
+    func testReplaceSkipsEmptySegments() {
+        let edits = ParagraphMatcher.replace(in: ["", ""], find: "x", replaceWith: "y", options: options)
+        XCTAssertTrue(edits.isEmpty)
+    }
+
+    func testReplaceCaseInsensitiveKeepsReplacementVerbatim() {
+        let edits = ParagraphMatcher.replace(in: ["HELLO"], find: "hello", replaceWith: "hi", options: options)
+        XCTAssertEqual(edits, [ParagraphMatcher.Edit(textIndex: 0, newText: "hi")])
+    }
+
+    func testReplaceWholeWordOnly() {
+        let opts = ReplaceOptions(wholeWord: true)
+        let edits = ParagraphMatcher.replace(in: ["cat category"], find: "cat", replaceWith: "dog", options: opts)
+        XCTAssertEqual(edits, [ParagraphMatcher.Edit(textIndex: 0, newText: "dog category")])
+    }
+
+    func testReplaceNothingReturnsEmpty() {
+        XCTAssertTrue(ParagraphMatcher.replace(in: ["abc"], find: "zzz", replaceWith: "y",
+                                               options: options).isEmpty)
+    }
 }
