@@ -2791,6 +2791,92 @@ git commit -m "fix: 全字匹配按组合字符序列判断，修非 BMP 字母�
 
 ---
 
+## Task 7d: 词字符改用 Unicode 通用类别判断（Task 7c 复核结论）
+
+**Files:**
+- Modify: `DocxReplace/Core/ParagraphMatcher.swift`
+- Modify: `DocxReplaceTests/ParagraphMatcherTests.swift`
+
+背景：复核用独立 oracle（44 520 组对照）确认非 BMP 那类已彻底修好，但暴露出 `CharacterSet.letters` 这个 API 本身不可靠，两个方向都会错：
+
+- **多含**：`CharacterSet.letters` 实际是 L* ∪ M*，把组合符号也算作字母。于是文本开头的孤立组合符会被当成词字符，`"\u{0301}cat"` 查 `cat` 全字匹配会漏掉应该命中的一处（孤儿组合符在真实文档里很少见，影响小）。
+- **漏掉**：本机实测有 6 227 个真实字母标量不在 `CharacterSet.letters` 里，包括西夏文 U+17000–U+187FF、西夏文补遗 U+18D00–U+18D1E、Todhri U+105C0–U+105F3。这些是**错误替换**：`"𗀀cat"` 查 `cat` 会被当成整词命中并真的改掉。
+
+改法：不再依赖 `CharacterSet`，直接看标量自己的 Unicode 通用类别 = L* ∪ Nd。
+
+**Step 1: 追加失败测试到 `ParagraphMatcherTests.swift`**
+
+```swift
+    func testWholeWordIgnoresOrphanCombiningMark() {
+        // 孤立的组合符 / 变体选择符属于 M*，不是词字符
+        let opts = ReplaceOptions(caseSensitive: true, wholeWord: true)
+        XCTAssertEqual(ParagraphMatcher.countMatches(in: ["\u{0301}cat"], find: "cat", options: opts), 1)
+        XCTAssertEqual(ParagraphMatcher.countMatches(in: ["\u{FE0F}cat"], find: "cat", options: opts), 1)
+    }
+
+    func testWholeWordRecognizesLettersMissingFromCharacterSetLetters() {
+        // CharacterSet.letters 在本机缺少部分真实字母（西夏文、Todhri），
+        // 不修的话会被当成词边界，产生错误替换
+        let opts = ReplaceOptions(caseSensitive: true, wholeWord: true)
+        XCTAssertEqual(ParagraphMatcher.countMatches(in: ["\u{17000}cat"], find: "cat", options: opts), 0)
+        XCTAssertEqual(ParagraphMatcher.countMatches(in: ["\u{105C0}cat"], find: "cat", options: opts), 0)
+        XCTAssertTrue(ParagraphMatcher.replace(in: ["\u{17000}cat"], find: "cat", replaceWith: "X",
+                                               options: opts).isEmpty)
+    }
+```
+
+**Step 2: 改 `DocxReplace/Core/ParagraphMatcher.swift`**
+
+删掉 `wordScalars` 常量，改为按通用类别判断：
+
+```swift
+    /// 词字符 = Unicode 通用类别 L*（字母，含中日韩、扩展区、西夏文等）∪ Nd（十进制数字）。
+    ///
+    /// 不用 `CharacterSet.letters`：它实测是 L* ∪ M*（多含组合符号），
+    /// 且在本机缺少 6 227 个真实字母标量（西夏文 U+17000 起、Todhri U+105C0 起等），
+    /// 漏掉字母会把词内命中误判成整词命中，从而改错文字。
+    private static func isWordScalar(_ scalar: UnicodeScalar) -> Bool {
+        switch scalar.properties.generalCategory {
+        case .uppercaseLetter, .lowercaseLetter, .titlecaseLetter, .modifierLetter, .otherLetter,
+             .decimalNumber:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// 判断该 UTF-16 码元位置所在的**完整字符**是否为词字符。
+    /// 必须按组合字符序列判断，不能只看单个码元：非 BMP 字符（𝒜、𗀀）是代理对，
+    /// 孤立代理项会被误判成词边界。
+    private static func isWordCharacter(_ haystack: NSString, at index: Int) -> Bool {
+        guard index >= 0, index < haystack.length else { return false }
+        let sequence = haystack.rangeOfComposedCharacterSequence(at: index)
+        guard let first = haystack.substring(with: sequence).unicodeScalars.first else { return false }
+        return isWordScalar(first)
+    }
+```
+
+**Step 3: 运行测试确认通过**
+
+```bash
+cd /Users/LB/Documents/AIProjects/DocxRepleace
+xcodebuild -project DocxReplace.xcodeproj -scheme DocxReplace -destination 'platform=macOS' test 2>&1 | tail -20
+```
+
+Expected: `** TEST SUCCEEDED **`，全量 81 个测试通过（79 + 2 新增）。既有的 29 个 ParagraphMatcher 测试必须继续通过，尤其是 `testWholeWordTreatsDecimalDigitAsWordCharacter`（①不算、1 算）与 `testWholeWordWithFlagEmojiDoesNotCrash`。
+
+**Step 4: 提交**
+
+```bash
+cd /Users/LB/Documents/AIProjects/DocxRepleace
+git add DocxReplace/Core/ParagraphMatcher.swift DocxReplaceTests/ParagraphMatcherTests.swift
+git commit -m "fix: 词字符改按 Unicode 通用类别判断，修 CharacterSet.letters 的多含与缺漏"
+```
+
+**这是 ParagraphMatcher 的最后一轮加固**：剩余的已知偏差只有「组合符紧跟在字母之后时 oracle 用标量、实现用字符簇」这一语义差异，属设计取舍（`e\u{0301}cat` 不命中是刻意的）。
+
+---
+
 ## Task 9: 段落与分段结构分析
 
 **Files:**
