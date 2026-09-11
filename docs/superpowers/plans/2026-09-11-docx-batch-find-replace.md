@@ -3305,7 +3305,7 @@ final class DocxTextReplacerTests: XCTestCase {
         let before = try DocxFixture.structuralSignature(documentText(data))
         let after = try DocxFixture.structuralSignature(documentText(out))
         XCTAssertEqual(before, after, "除 w:t 文字外，XML 结构必须完全一致")
-        XCTAssertTrue(documentText(out).contains("上海集团"))
+        XCTAssertTrue(try documentText(out).contains("上海集团"))
     }
 
     func testReplacementInheritsFirstRunFormatting() throws {
@@ -3364,7 +3364,8 @@ final class DocxTextReplacerTests: XCTestCase {
 
     func testEntitiesSurviveReplacement() throws {
         let data = try DocxFixture.docx(bodyXML: DocxFixture.paragraph(["a &amp; b"]))
-        let (out, _) = try DocxTextReplacer.replace(docxData: data, find: "& b", replaceWith: "<c>",
+        // find 用 "b"：未被命中的 &amp; 应原样保留，而替换进去的 <c> 应被转义
+        let (out, _) = try DocxTextReplacer.replace(docxData: data, find: "b", replaceWith: "<c>",
                                                     options: options)
         XCTAssertTrue(try documentText(out).contains("a &amp; &lt;c&gt;"))
     }
@@ -3527,15 +3528,18 @@ cd /Users/LB/Documents/AIProjects/DocxRepleace
 xcodebuild -project DocxReplace.xcodeproj -scheme DocxReplace -destination 'platform=macOS' test -only-testing:DocxReplaceTests/DocxTextReplacerTests 2>&1 | tail -30
 ```
 
-Expected: `** TEST SUCCEEDED **`，10 个测试全部通过。
+Expected: `** TEST SUCCEEDED **`，11 个测试全部通过。
 
-- [ ] **Step 6: 提交**
+- [ ] **Step 6: 运行全量测试并提交**
 
 ```bash
 cd /Users/LB/Documents/AIProjects/DocxRepleace
-git add DocxReplace/Core/DocxTextReplacer.swift DocxReplaceTests/DocxFixture.swift DocxReplaceTests/DocxTextReplacerTests.swift
+xcodebuild -project DocxReplace.xcodeproj -scheme DocxReplace -destination 'platform=macOS' test 2>&1 | tail -10
+git add DocxReplace/Core DocxReplaceTests
 git commit -m "feat: .docx 替换主流程，覆盖页眉页脚文本框，结构保持不变"
 ```
+
+Expected: 全量 106 个测试通过（91 + Step 0 的 4 个 + 本任务的 11 个）。
 
 ---
 
