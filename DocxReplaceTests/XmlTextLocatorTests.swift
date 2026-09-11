@@ -27,9 +27,9 @@ final class XmlTextLocatorTests: XCTestCase {
 
     func testDetectsPreserveSpaceAttribute() {
         let yes = nodes("<w:t xml:space=\"preserve\"> x </w:t>")
-        XCTAssertTrue(yes[0].hasPreserveSpace)
+        XCTAssertTrue(yes[0].hasSpaceAttribute)
         let no = nodes("<w:t> x </w:t>")
-        XCTAssertFalse(no[0].hasPreserveSpace)
+        XCTAssertFalse(no[0].hasSpaceAttribute)
     }
 
     func testHandlesSelfClosingTag() {
@@ -73,7 +73,7 @@ final class XmlTextLocatorTests: XCTestCase {
     }
 
     private func rebuild(_ xml: String, edits: [Int: String]) -> String {
-        String(decoding: XmlTextLocator.rebuild(xml: [UInt8](xml.utf8), edits: edits), as: UTF8.self)
+        String(decoding: XmlTextLocator.rebuild(xml: [UInt8](xml.utf8), edits: edits).xml, as: UTF8.self)
     }
 
     func testRebuildReplacesOnlyTargetText() {
@@ -142,5 +142,37 @@ final class XmlTextLocatorTests: XCTestCase {
 
     func testDecodesMixedCDATAContent() {
         XCTAssertEqual(nodes("<w:t>pre<![CDATA[<&]]>post</w:t>")[0].text, "pre<&post")
+    }
+
+    func testRebuildReportsAppliedCountAndDropsBadKeys() {
+        let xml = "<w:t>a</w:t><w:t>b</w:t>"
+        let result = XmlTextLocator.rebuild(xml: [UInt8](xml.utf8), edits: [0: "X", 99: "Y", -1: "Z"])
+        XCTAssertEqual(result.applied, 1)
+        XCTAssertEqual(String(decoding: result.xml, as: UTF8.self), "<w:t>X</w:t><w:t>b</w:t>")
+    }
+
+    func testRebuildPreservesOtherAttributesOnEditedElement() {
+        let out = rebuild("<w:t w:rsidR=\"00AB12\">旧</w:t>", edits: [0: "新"])
+        XCTAssertEqual(out, "<w:t w:rsidR=\"00AB12\">新</w:t>")
+    }
+
+    func testRebuildSelfClosingWithExistingAttribute() {
+        let out = rebuild("<w:t xml:space=\"preserve\"/>", edits: [0: " x"])
+        XCTAssertEqual(out, "<w:t xml:space=\"preserve\"> x</w:t>")
+    }
+
+    func testRebuildDoesNotDuplicateExplicitDefaultSpace() {
+        let out = rebuild("<w:t xml:space=\"default\">abc</w:t>", edits: [0: " abc "])
+        XCTAssertEqual(out, "<w:t xml:space=\"default\"> abc </w:t>")
+    }
+
+    func testRebuildEscapesCarriageReturn() {
+        XCTAssertEqual(rebuild("<w:t>x</w:t>", edits: [0: "a\rb"]), "<w:t>a&#13;b</w:t>")
+    }
+
+    func testLeadingSpaceBeforeCombiningMarkGetsPreserve() {
+        // 前导空格后紧跟组合字符：按 Character 判断会误判，必须按 UnicodeScalar
+        let out = rebuild("<w:t>x</w:t>", edits: [0: " \u{0301}abc"])
+        XCTAssertEqual(out, "<w:t xml:space=\"preserve\"> \u{0301}abc</w:t>")
     }
 }
