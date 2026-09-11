@@ -15,8 +15,9 @@ enum ParagraphMatcher {
         var newText: String
     }
 
-    /// 词字符集合：字母与数字（含中日韩文字）。与 Word 的「全字匹配」行为一致。
-    private static let wordCharacters = CharacterSet.letters.union(.decimalDigits)
+    /// 词字符集合：Unicode 字母（L*，含中日韩及扩展区）与十进制数字（Nd）。
+    /// 取舍：上标/罗马数字/分数（①Ⅷ½ 等 No/Nl 类）**不算**词字符。
+    private static let wordScalars = CharacterSet.letters.union(.decimalDigits)
 
     static func countMatches(in texts: [String], find: String, options: ReplaceOptions) -> Int {
         guard !find.isEmpty else { return 0 }
@@ -87,21 +88,19 @@ enum ParagraphMatcher {
         return ranges
     }
 
-    /// 前后紧邻的码元是否都不是词字符。只检查边界那一个码元，不做任何索引运算。
+    /// 判断该 UTF-16 码元位置所在的**完整字符**是否为词字符。
+    /// 必须按组合字符序列判断，不能只看单个码元：非 BMP 字符（𝒜、𠀀）是代理对，
+    /// 孤立代理项不属于字母集，会被误判成词边界，从而把词内命中当成整词命中。
+    private static func isWordCharacter(_ haystack: NSString, at index: Int) -> Bool {
+        guard index >= 0, index < haystack.length else { return false }
+        let sequence = haystack.rangeOfComposedCharacterSequence(at: index)
+        guard let first = haystack.substring(with: sequence).unicodeScalars.first else { return false }
+        return wordScalars.contains(first)
+    }
+
     private static func isWholeWordMatch(_ haystack: NSString, _ found: NSRange) -> Bool {
-        if found.location > 0 {
-            let before = NSRange(location: found.location - 1, length: 1)
-            if haystack.rangeOfCharacter(from: wordCharacters, range: before).location != NSNotFound {
-                return false
-            }
-        }
-        let afterStart = found.location + found.length
-        if afterStart < haystack.length {
-            let after = NSRange(location: afterStart, length: 1)
-            if haystack.rangeOfCharacter(from: wordCharacters, range: after).location != NSNotFound {
-                return false
-            }
-        }
+        if isWordCharacter(haystack, at: found.location - 1) { return false }
+        if isWordCharacter(haystack, at: found.location + found.length) { return false }
         return true
     }
 }

@@ -143,4 +143,31 @@ final class ParagraphMatcherTests: XCTestCase {
         XCTAssertEqual(edits, [ParagraphMatcher.Edit(textIndex: 0, newText: "X"),
                                ParagraphMatcher.Edit(textIndex: 2, newText: "")])
     }
+
+    func testWholeWordRejectsMatchAfterNonBMPLetter() {
+        let opts = ReplaceOptions(caseSensitive: true, wholeWord: true)
+        XCTAssertEqual(ParagraphMatcher.countMatches(in: ["𝒜cat"], find: "cat", options: opts), 0)
+        XCTAssertTrue(ParagraphMatcher.replace(in: ["𝒜cat"], find: "cat", replaceWith: "X",
+                                               options: opts).isEmpty)
+        // CJK 扩展 B 区字符同理
+        XCTAssertEqual(ParagraphMatcher.countMatches(in: ["𠀀cat"], find: "cat", options: opts), 0)
+        XCTAssertEqual(ParagraphMatcher.countMatches(in: ["cat𝒜"], find: "cat", options: opts), 0)
+    }
+
+    func testWholeWordAcceptsMatchBesideNonWordEmoji() {
+        let opts = ReplaceOptions(caseSensitive: true, wholeWord: true)
+        XCTAssertEqual(ParagraphMatcher.countMatches(in: ["👍cat"], find: "cat", options: opts), 1)
+    }
+
+    func testWholeWordTreatsComposedLetterAsWordCharacter() {
+        let opts = ReplaceOptions(caseSensitive: true, wholeWord: true)
+        XCTAssertEqual(ParagraphMatcher.countMatches(in: ["e\u{0301}cat"], find: "cat", options: opts), 0)
+    }
+
+    func testWholeWordTreatsDecimalDigitAsWordCharacter() {
+        // 明确的取舍：十进制数字(Nd)算词字符；上标/罗马数字/分数(No/Nl，如 ①Ⅷ½)不算
+        let opts = ReplaceOptions(caseSensitive: true, wholeWord: true)
+        XCTAssertEqual(ParagraphMatcher.countMatches(in: ["1cat"], find: "cat", options: opts), 0)
+        XCTAssertEqual(ParagraphMatcher.countMatches(in: ["①cat"], find: "cat", options: opts), 1)
+    }
 }
