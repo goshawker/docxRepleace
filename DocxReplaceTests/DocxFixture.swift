@@ -27,6 +27,9 @@ enum DocxFixture {
         return regex.stringByReplacingMatches(in: xml, range: range, withTemplate: "<w:t/>")
     }
 
+    /// 测试用：[Content_Types].xml 内容（不含额外部件），供手工拼装条目列表的测试直接引用
+    static let contentTypesForTest = contentTypes(extraParts: [])
+
     private static func contentTypes(extraParts: [String]) -> String {
         var overrides = """
         <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>

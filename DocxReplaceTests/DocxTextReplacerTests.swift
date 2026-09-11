@@ -137,4 +137,25 @@ final class DocxTextReplacerTests: XCTestCase {
             XCTAssertNoThrow(try archive.contents(of: entry), "条目应可读：\(entry.name)")
         }
     }
+
+    func testRejectsDuplicateTargetPartNames() throws {
+        // 手工拼一个含两个同名 document.xml 的归档（ZipWriter 允许重名）
+        let inner = DocxFixture.documentXML(bodyXML: DocxFixture.paragraph(["旧名"]))
+        let entries = [
+            ZipWriter.makeEntry(name: "[Content_Types].xml",
+                                contents: Data(DocxFixture.contentTypesForTest.utf8),
+                                date: Date(timeIntervalSince1970: 0)),
+            ZipWriter.makeEntry(name: "word/document.xml", contents: Data(inner.utf8),
+                                date: Date(timeIntervalSince1970: 0)),
+            ZipWriter.makeEntry(name: "word/document.xml", contents: Data(inner.utf8),
+                                date: Date(timeIntervalSince1970: 0)),
+        ]
+        let data = try ZipWriter.build(entries)
+        XCTAssertThrowsError(try DocxTextReplacer.countMatches(docxData: data, find: "旧名",
+                                                               options: options)) { error in
+            XCTAssertEqual(error as? ZipError, .corruptEntry("word/document.xml 在归档中重复出现"))
+        }
+        XCTAssertThrowsError(try DocxTextReplacer.replace(docxData: data, find: "旧名",
+                                                          replaceWith: "新名", options: options))
+    }
 }

@@ -2,26 +2,35 @@ import Foundation
 
 /// .docx 替换引擎。只读分析 + 原始字节改写，未命中的部件原样直拷。
 enum DocxTextReplacer {
-    static func targetPartNames(in archive: ZipArchive) -> [String] {
-        archive.entries.map(\.name).filter { name in
-            if name == "word/document.xml" { return true }
-            if name == "word/footnotes.xml" || name == "word/endnotes.xml" || name == "word/comments.xml" {
-                return true
+    static func targetPartNames(in archive: ZipArchive) throws -> [String] {
+        var names: [String] = []
+        for entry in archive.entries where isTargetPart(entry.name) {
+            if names.contains(entry.name) {
+                // 重名会让「按名取第一个」与「按名改写全部」错位：第二个条目会被整体覆盖，
+                // 计数也会翻倍。Word 不会产出，但第三方工具可能，必须响亮失败。
+                throw ZipError.corruptEntry("\(entry.name) 在归档中重复出现")
             }
-            guard name.hasPrefix("word/"), !name.dropFirst(5).contains("/") else { return false }
-            let file = String(name.dropFirst(5))
-            if (file.hasPrefix("header") || file.hasPrefix("footer")), file.hasSuffix(".xml") {
-                return true
-            }
-            return false
+            names.append(entry.name)
         }
+        return names
+    }
+
+    /// 目标部件：正文、页眉、页脚、脚注、尾注、批注
+    private static func isTargetPart(_ name: String) -> Bool {
+        if name == "word/document.xml" { return true }
+        if name == "word/footnotes.xml" || name == "word/endnotes.xml" || name == "word/comments.xml" {
+            return true
+        }
+        guard name.hasPrefix("word/"), !name.dropFirst(5).contains("/") else { return false }
+        let file = String(name.dropFirst(5))
+        return (file.hasPrefix("header") || file.hasPrefix("footer")) && file.hasSuffix(".xml")
     }
 
     static func countMatches(docxData: Data, find: String, options: ReplaceOptions) throws -> Int {
         guard !find.isEmpty else { return 0 }
         let archive = try ZipArchive(data: docxData)
         var total = 0
-        for name in targetPartNames(in: archive) {
+        for name in try targetPartNames(in: archive) {
             guard let entry = archive.entry(named: name) else { continue }
             let xml = [UInt8](try archive.contents(of: entry))
             let analysis = try DocxXmlAnalyzer.analyze(xml)
@@ -38,7 +47,7 @@ enum DocxTextReplacer {
                         options: ReplaceOptions) throws -> (data: Data, replacedCount: Int) {
         guard !find.isEmpty else { return (docxData, 0) }
         let archive = try ZipArchive(data: docxData)
-        let targets = Set(targetPartNames(in: archive))
+        let targets = Set(try targetPartNames(in: archive))
 
         var partEdits: [String: (xml: [UInt8], edits: [Int: String], count: Int)] = [:]
         for name in targets {
