@@ -71,4 +71,76 @@ final class XmlTextLocatorTests: XCTestCase {
         XCTAssertEqual(String(decoding: bytes[node.innerStart..<node.innerEnd], as: UTF8.self), "abc")
         XCTAssertEqual(String(decoding: bytes[node.elementStart..<node.elementEnd], as: UTF8.self), xml)
     }
+
+    private func rebuild(_ xml: String, edits: [Int: String]) -> String {
+        String(decoding: XmlTextLocator.rebuild(xml: [UInt8](xml.utf8), edits: edits), as: UTF8.self)
+    }
+
+    func testRebuildReplacesOnlyTargetText() {
+        let xml = "<w:p><w:r><w:t>北京公司</w:t></w:r></w:p>"
+        let out = rebuild(xml, edits: [0: "上海集团"])
+        XCTAssertEqual(out, "<w:p><w:r><w:t>上海集团</w:t></w:r></w:p>")
+    }
+
+    func testRebuildKeepsRunPropertiesIntact() {
+        let xml = "<w:p><w:r><w:rPr><w:b/><w:color w:val=\"FF0000\"/></w:rPr><w:t>旧</w:t></w:r></w:p>"
+        let out = rebuild(xml, edits: [0: "新"])
+        XCTAssertEqual(out, "<w:p><w:r><w:rPr><w:b/><w:color w:val=\"FF0000\"/></w:rPr><w:t>新</w:t></w:r></w:p>")
+    }
+
+    func testRebuildAddsPreserveSpaceWhenNeeded() {
+        let out = rebuild("<w:t>abc</w:t>", edits: [0: " abc "])
+        XCTAssertEqual(out, "<w:t xml:space=\"preserve\"> abc </w:t>")
+    }
+
+    func testRebuildDoesNotDuplicatePreserveSpace() {
+        let out = rebuild("<w:t xml:space=\"preserve\">abc</w:t>", edits: [0: " abc "])
+        XCTAssertEqual(out, "<w:t xml:space=\"preserve\"> abc </w:t>")
+    }
+
+    func testRebuildEscapesEntities() {
+        let out = rebuild("<w:t>x</w:t>", edits: [0: "a & b <c>"])
+        XCTAssertEqual(out, "<w:t>a &amp; b &lt;c&gt;</w:t>")
+    }
+
+    func testRebuildConvertsSelfClosingTag() {
+        let out = rebuild("<w:p><w:r><w:t/></w:r></w:p>", edits: [0: "填入"])
+        XCTAssertEqual(out, "<w:p><w:r><w:t>填入</w:t></w:r></w:p>")
+    }
+
+    func testRebuildCanEmptyText() {
+        let out = rebuild("<w:t>要删掉</w:t>", edits: [0: ""])
+        XCTAssertEqual(out, "<w:t></w:t>")
+    }
+
+    func testRebuildHandlesMultipleEditsAndAttributeOrder() {
+        let xml = "<w:r><w:t xml:space=\"preserve\">A</w:t></w:r><w:r><w:t>B</w:t></w:r>"
+        let out = rebuild(xml, edits: [0: "AAA", 1: "BBB"])
+        XCTAssertEqual(out, "<w:r><w:t xml:space=\"preserve\">AAA</w:t></w:r><w:r><w:t>BBB</w:t></w:r>")
+    }
+
+    func testRebuildLeavesOtherElementsAlone() {
+        let xml = "<w:p><w:pPr><w:jc w:val=\"center\"/></w:pPr><w:r><w:t>旧</w:t></w:r></w:p>"
+        let out = rebuild(xml, edits: [0: "新"])
+        XCTAssertEqual(out, "<w:p><w:pPr><w:jc w:val=\"center\"/></w:pPr><w:r><w:t>新</w:t></w:r></w:p>")
+    }
+
+    func testRebuildWithNoEditsReturnsInput() {
+        let xml = "<w:t>原样</w:t>"
+        XCTAssertEqual(rebuild(xml, edits: [:]), xml)
+    }
+
+    func testIgnoresCloseTagInsideCDATA() {
+        let xml = "<w:t><![CDATA[a</w:t>b]]></w:t>"
+        let result = nodes(xml)
+        XCTAssertEqual(result.count, 1)
+        XCTAssertEqual(result[0].text, "a</w:t>b")
+        let bytes = [UInt8](xml.utf8)
+        XCTAssertEqual(String(decoding: bytes[result[0].innerStart..<result[0].innerEnd], as: UTF8.self),
+                       "<![CDATA[a</w:t>b]]>")
+    }
+
+    func testDecodesMixedCDATAContent() {
+        XCTAssertEqual(nodes("<w:t>pre<![CDATA[<&]]>post</w:t>")[0].text, "pre<&post")
+    }
 }

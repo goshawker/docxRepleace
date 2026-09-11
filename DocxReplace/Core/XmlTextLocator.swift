@@ -10,7 +10,7 @@ enum XmlTextLocator {
         var innerEnd: Int
         var isSelfClosing: Bool
         var hasPreserveSpace: Bool
-        var attributes: String   // "<w:t" 之后到 ">" 或 "/" 之前的原文（含前导空白）
+        var attributes: String   // "<w:t" 之后、">" 或 "/" 之前的原文，首尾空白均原样保留，rebuild 会原样拼回
         var text: String         // 已解码实体的文字
     }
 
@@ -54,7 +54,7 @@ enum XmlTextLocator {
                 i = tagEnd + 1
             } else {
                 let innerStart = tagEnd + 1
-                guard let closeStart = find(xml, from: innerStart, utf8: "</w:t") else { break }
+                guard let closeStart = findCloseTag(xml, from: innerStart) else { break }
                 let closeEnd = findTagEnd(xml, from: closeStart)
                 guard closeEnd < n else { break }
                 let text = decodeText(Array(xml[innerStart..<closeStart]))
@@ -66,6 +66,62 @@ enum XmlTextLocator {
             }
         }
         return nodes
+    }
+
+    /// 找到 w:t 的结束标签位置，单趟扫描并跳过内部的 CDATA 段（其中可能含 "</w:t" 字节）
+    private static func findCloseTag(_ xml: [UInt8], from index: Int) -> Int? {
+        var i = index
+        while i < xml.count {
+            if xml[i] == 0x3C {                                  // '<'
+                if matches(xml, at: i, utf8: "</w:t") { return i }
+                if matches(xml, at: i, utf8: "<![CDATA[") {
+                    guard let end = find(xml, from: i + 9, utf8: "]]>") else { return nil }
+                    i = end + 3
+                    continue
+                }
+            }
+            i += 1
+        }
+        return nil
+    }
+
+    /// 按 w:t 的出现序号应用新文字，返回新的 XML 字节。
+    /// 只重建被编辑的 `w:t` 元素，其余字节原样拼接。
+    ///
+    /// 调用方必须传入与分析时**完全相同**的字节，否则序号会错位。
+    static func rebuild(xml: [UInt8], edits: [Int: String]) -> [UInt8] {
+        guard !edits.isEmpty else { return xml }
+        let nodes = findTextNodes(in: xml)
+        let targets: [(node: TextNode, newText: String)] = edits
+            .compactMap { index, newText in
+                guard index >= 0, index < nodes.count else { return nil }
+                return (nodes[index], newText)
+            }
+            .sorted { $0.node.elementStart < $1.node.elementStart }
+
+        var out = Data()
+        var cursor = 0
+        for target in targets {
+            guard target.node.elementStart >= cursor else { continue }
+            out.append(contentsOf: xml[cursor..<target.node.elementStart])
+            var attributes = target.node.attributes
+            if needsPreserveSpace(target.newText), !target.node.hasPreserveSpace {
+                attributes += " xml:space=\"preserve\""
+            }
+            out.append(contentsOf: Array("<w:t\(attributes)>\(escape(target.newText))</w:t>".utf8))
+            cursor = target.node.elementEnd
+        }
+        out.append(contentsOf: xml[cursor...])
+        return [UInt8](out)
+    }
+
+    private static func needsPreserveSpace(_ text: String) -> Bool {
+        guard let first = text.first, let last = text.last else { return false }
+        return isSpace(first) || isSpace(last)
+    }
+
+    private static func isSpace(_ ch: Character) -> Bool {
+        ch == " " || ch == "\t" || ch == "\n" || ch == "\r"
     }
 
     // MARK: - 字节工具
@@ -127,11 +183,25 @@ enum XmlTextLocator {
     }
 
     private static func decodeText(_ bytes: [UInt8]) -> String {
-        let s = String(decoding: bytes, as: UTF8.self)
-        if s.hasPrefix("<![CDATA[") && s.hasSuffix("]]>") {
-            return String(s.dropFirst(9).dropLast(3))
+        var out = ""
+        var i = 0
+        while i < bytes.count {
+            if matches(bytes, at: i, utf8: "<![CDATA[") {
+                guard let end = find(bytes, from: i + 9, utf8: "]]>") else {
+                    out += String(decoding: bytes[i...], as: UTF8.self)
+                    break
+                }
+                out += String(decoding: bytes[(i + 9)..<end], as: UTF8.self)
+                i = end + 3
+            } else if let next = find(bytes, from: i, utf8: "<![CDATA[") {
+                out += unescape(String(decoding: bytes[i..<next], as: UTF8.self))
+                i = next
+            } else {
+                out += unescape(String(decoding: bytes[i...], as: UTF8.self))
+                break
+            }
         }
-        return unescape(s)
+        return out
     }
 
     // MARK: - 实体
