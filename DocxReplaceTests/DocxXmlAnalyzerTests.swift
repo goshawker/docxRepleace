@@ -86,4 +86,16 @@ final class DocxXmlAnalyzerTests: XCTestCase {
         XCTAssertEqual(analysis.texts, XmlTextLocator.findTextNodes(in: bytes).map(\.text))
         XCTAssertEqual(analysis.texts, ["一", "二", "三", "四", "五"])
     }
+
+    /// 不在任何 w:p 内的 w:t 曾被静默跳过（不报错也不处理）。
+    /// Word 不会产出，但第三方工具可能是这种结构，必须响亮失败
+    func testOrphanTextOutsideParagraphFailsLoudly() {
+        XCTAssertThrowsError(try analyze("<w:body><w:t>游离</w:t></w:body>"))
+    }
+
+    /// 未闭合的嵌套段落（w:p 套 w:p 但缺结束标签）应作为解析错误抛出，
+    /// 不能被容错解析吞掉
+    func testThrowsOnMalformedNestedStructure() {
+        XCTAssertThrowsError(try analyze("<w:p><w:r><w:t>甲</w:t></w:r><w:p>"))
+    }
 }

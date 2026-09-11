@@ -155,6 +155,44 @@ final class ZipArchiveTests: XCTestCase {
         }
     }
 
+    /// 65535 条正是 EOCD 记录条目数的 0xFFFF（zip64 哨兵），
+    /// 写出后会被我们自己的读取器判为 zip64Unsupported，必须写出时就拒绝
+    func testBuildRejectsExactlyUInt16MaxEntries() {
+        let entries = (0..<Int(UInt16.max)).map { index in
+            ZipOutputEntry(name: "f\(index)", dosTime: 0, dosDate: 0, method: 0, crc32: 0,
+                           uncompressedSize: 0, externalAttributes: 0, compressedData: Data())
+        }
+        XCTAssertEqual(entries.count, 65535)
+        XCTAssertThrowsError(try ZipWriter.build(entries)) { error in
+            XCTAssertEqual(error as? ZipError, .archiveTooLarge)
+        }
+    }
+
+    /// makeEntry 选择压缩方式时必须与读取器的 inflateLimit 对称，
+    /// 否则写出的归档会被我们自己的读取器判为 implausibleSize
+    func testMakeEntryRoundTripsThroughReader() throws {
+        var incompressible = [UInt8]()
+        var seed: UInt32 = 20260911
+        for _ in 0..<4096 {
+            seed = seed &* 1664525 &+ 1013904223
+            incompressible.append(UInt8(truncatingIfNeeded: seed >> 16))
+        }
+        // 超过 64 MiB 的全零内容：压缩比极高，但解压尺寸超过读取器上限 64 MiB。
+        // 修复前 makeEntry 会选 deflate，读回来被 inflateLimit 拒绝
+        let highRatio = Data(repeating: 0, count: 64 * 1024 * 1024 + 1024)
+        let inputs: [(name: String, contents: Data)] = [
+            ("empty.bin", Data()),
+            ("random.bin", Data(incompressible)),
+            ("zeros.bin", highRatio),
+        ]
+        for input in inputs {
+            let entry = ZipWriter.makeEntry(name: input.name, contents: input.contents, date: Date())
+            let archive = try ZipArchive(data: try ZipWriter.build([entry]))
+            let target = try XCTUnwrap(archive.entry(named: input.name))
+            XCTAssertEqual(try archive.contents(of: target), input.contents, "\(input.name) 应原样回读")
+        }
+    }
+
     func testRejectsUnsupportedCompressionMethod() throws {
         let entry = ZipOutputEntry(name: "m12.bin", dosTime: 0, dosDate: 0, method: 12, crc32: 0,
                                    uncompressedSize: 0, externalAttributes: 0, compressedData: Data([1, 2, 3]))

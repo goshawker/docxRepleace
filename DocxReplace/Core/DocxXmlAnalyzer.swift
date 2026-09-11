@@ -17,7 +17,8 @@ enum DocxXmlError: Error, Equatable {
 /// 2. 段落内的换行/制表符把文字切成多个片段（匹配不跨片段）
 enum DocxXmlAnalyzer {
     struct PartAnalysis: Equatable {
-        /// 每个片段包含的 w:t 全局序号
+        /// 每个片段包含的 w:t 全局序号。
+        /// 注意：顺序不保证按序号升序 —— 父段落的分段会先于其文本框内嵌套段落的分段输出。
         var segments: [[Int]]
         /// 每个 w:t 的文字（下标即全局序号）
         var texts: [String]
@@ -60,6 +61,8 @@ enum DocxXmlAnalyzer {
                 if node.name == "w:t" {
                     if let index = indexByNode[ObjectIdentifier(node)] {
                         current.append(index)
+                    } else {
+                        assertionFailure("w:t 节点未在序号表中，枚举逻辑出现分歧")
                     }
                     return
                 }
@@ -92,6 +95,13 @@ enum DocxXmlAnalyzer {
         }
         if let root = document.rootElement() {
             collectParagraphs(root)
+        }
+
+        // 每个 w:t 都必须被分配到某个分段：不在任何 w:p 内的 w:t（第三方工具会产出）
+        // 若被静默跳过，既不报错也不处理，宁可整份部件报错
+        let assigned = segments.reduce(0) { $0 + $1.count }
+        guard assigned == textNodes.count else {
+            throw DocxXmlError.nodeCountMismatch(dom: textNodes.count, raw: assigned)
         }
 
         return PartAnalysis(segments: segments, texts: rawNodes.map(\.text))

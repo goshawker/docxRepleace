@@ -13,7 +13,9 @@ struct ZipOutputEntry {
 
 enum ZipWriter {
     static func build(_ entries: [ZipOutputEntry]) throws -> Data {
-        guard entries.count <= Int(UInt16.max) else { throw ZipError.archiveTooLarge }
+        // EOCD 用 0xFFFF 表示 zip64 哨兵，65535 条会被读取器判为 zip64 而拒绝，
+        // 因此上限必须严格小于 UInt16.max
+        guard entries.count < Int(UInt16.max) else { throw ZipError.archiveTooLarge }
         var out = Data()
         var central = Data()
         for entry in entries {
@@ -79,7 +81,10 @@ enum ZipWriter {
                           externalAttributes: UInt32 = 0) -> ZipOutputEntry {
         let (dosTime, dosDate) = dosDateTime(from: date)
         let crc = ZipCRC32.checksum(contents)
-        if let deflated = ZipCompression.deflate(contents), deflated.count < contents.count, !contents.isEmpty {
+        // 上限与读取器的 inflateLimit 保持一致：否则写出的归档会被我们自己判为
+        // implausibleSize 而无法回读，此时退回 stored
+        if let deflated = ZipCompression.deflate(contents), deflated.count < contents.count, !contents.isEmpty,
+           contents.count <= max(64 * 1024 * 1024, deflated.count * 256) {
             return ZipOutputEntry(name: name, dosTime: dosTime, dosDate: dosDate, method: 8,
                                   crc32: crc, uncompressedSize: UInt32(contents.count),
                                   externalAttributes: externalAttributes, compressedData: deflated)
