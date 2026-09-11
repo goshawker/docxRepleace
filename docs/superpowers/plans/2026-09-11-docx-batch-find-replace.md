@@ -2515,6 +2515,188 @@ git commit -m "test: 覆盖替换区间计算的各种情形"
 
 ---
 
+## Task 7b: ParagraphMatcher 偏移单位改为 UTF-16（Task 7/8 审查结论）
+
+**Files:**
+- Modify: `DocxReplace/Core/ParagraphMatcher.swift`
+- Modify: `DocxReplaceTests/ParagraphMatcherTests.swift`
+
+背景：审查用对抗性输入找到两个真实缺陷，都源于「偏移量按 `Character` 计」：
+
+1. **跨 run 的字素簇会静默改错文字**。`Character` 计数在字符串拼接时**不可加**：`"a"` + `"\u{0301}b"` 拼成 `"áb"` 只有 2 个 Character，但两个 run 的 `count` 之和是 3。于是 run 起始偏移与拼接串中的实际位置错位。实例：`texts = ["a", "\u{0301}b"]`、`find = "b"`、`replaceWith = "X"` → 当前实现返回 `Edit(1, "Xb")`，应用后得到 `"aXb"`，而正确答案是 `"áX"`（重音被删、要找的 `b` 反而留下）。同样的问题出现在肤色 emoji、国旗、韩文拼字、ZWJ 序列上。**这条路径绕过 Task 10 的两道防线**（结果仍是合法 XML、节点数不变）。
+2. **`wholeWord` 会崩溃**。Foundation 的 `range(of:)` 可能返回边界落在字素簇内部的索引，`text.index(before:)` / `text[range.upperBound]` 会触发 fatal error。实例：`matchRanges(in: "🇳🇨", find: "🇨", options: ReplaceOptions(caseSensitive: true, wholeWord: true))`。
+
+修法：偏移单位全部改用 **UTF-16 码元**（拼接时可加），匹配与边界判断都用 `NSString` API，代码里不再出现 `String.Index` 运算。
+
+**Step 1: 追加失败测试到 `ParagraphMatcherTests.swift`**
+
+```swift
+    func testCombiningMarkSplitAcrossRuns() {
+        // "a" + 组合符 拼成一个字素簇：按 Character 计偏移会错位，必须按 UTF-16
+        let edits = ParagraphMatcher.replace(in: ["a", "\u{0301}b"], find: "b", replaceWith: "X",
+                                             options: options)
+        XCTAssertEqual(edits, [ParagraphMatcher.Edit(textIndex: 1, newText: "\u{0301}X")])
+    }
+
+    func testEmojiSkinToneSplitAcrossRuns() {
+        let edits = ParagraphMatcher.replace(in: ["👍", "🏽x"], find: "x", replaceWith: "X", options: options)
+        XCTAssertEqual(edits, [ParagraphMatcher.Edit(textIndex: 1, newText: "🏽X")])
+    }
+
+    func testWholeWordWithFlagEmojiDoesNotCrash() {
+        let opts = ReplaceOptions(caseSensitive: true, wholeWord: true)
+        XCTAssertEqual(ParagraphMatcher.matchRanges(in: "🇳🇨", find: "🇨", options: opts), [2..<4])
+    }
+
+    func testCountAndReplaceAgreeOnEmojiMatch() {
+        // 不能出现「计数 1 处，却一处都没改」
+        let texts = ["👍🏽"]
+        XCTAssertEqual(ParagraphMatcher.countMatches(in: texts, find: "👍", options: options), 1)
+        XCTAssertEqual(ParagraphMatcher.replace(in: texts, find: "👍", replaceWith: "X", options: options),
+                       [ParagraphMatcher.Edit(textIndex: 0, newText: "X🏽")])
+    }
+
+    func testEmptyRunInsideMatchProducesNoSpuriousEdit() {
+        let edits = ParagraphMatcher.replace(in: ["A", "", "B"], find: "AB", replaceWith: "X", options: options)
+        XCTAssertEqual(edits, [ParagraphMatcher.Edit(textIndex: 0, newText: "X"),
+                               ParagraphMatcher.Edit(textIndex: 2, newText: "")])
+    }
+```
+
+**Step 2: 用新文件整体替换 `DocxReplace/Core/ParagraphMatcher.swift`**
+
+```swift
+import Foundation
+
+/// 在一个段落（或段落内被换行/制表符切分出的片段）的文字上做查找与替换。
+/// texts 按 w:t 出现顺序给出，返回的 Edit.textIndex 即该数组下标。
+///
+/// 所有偏移量一律以 **UTF-16 码元** 计。原因：
+/// 1. UTF-16 偏移在字符串拼接时是可加的，而 Character 偏移不是 —— 当一个字素簇横跨
+///    两个 run（组合符、肤色 emoji、国旗、韩文拼字、ZWJ 序列）时，按 Character 累加的
+///    run 起始偏移会与拼接串中的实际位置错位，导致静默改错文字。
+/// 2. 与 Foundation 的 NSString 匹配 API 单位一致，代码里不再出现 String.Index 运算，
+///    也就不会因索引落在字素簇内部而崩溃。
+enum ParagraphMatcher {
+    struct Edit: Equatable {
+        var textIndex: Int
+        var newText: String
+    }
+
+    /// 词字符集合：字母与数字（含中日韩文字）。与 Word 的「全字匹配」行为一致。
+    private static let wordCharacters = CharacterSet.letters.union(.decimalDigits)
+
+    static func countMatches(in texts: [String], find: String, options: ReplaceOptions) -> Int {
+        guard !find.isEmpty else { return 0 }
+        return matchRanges(in: texts.joined(), find: find, options: options).count
+    }
+
+    static func replace(in texts: [String], find: String, replaceWith: String,
+                        options: ReplaceOptions) -> [Edit] {
+        guard !find.isEmpty, !texts.isEmpty else { return [] }
+        let matches = matchRanges(in: texts.joined(), find: find, options: options)
+        guard !matches.isEmpty else { return [] }
+
+        var starts: [Int] = []
+        var offset = 0
+        for text in texts {
+            starts.append(offset)
+            offset += text.utf16.count
+        }
+
+        var editsByText: [Int: [(range: Range<Int>, replacement: String)]] = [:]
+        for match in matches {
+            func overlaps(_ index: Int) -> Bool {
+                starts[index] < match.upperBound && starts[index] + texts[index].utf16.count > match.lowerBound
+            }
+            guard let first = texts.indices.first(where: overlaps),
+                  let last = texts.indices.last(where: overlaps) else { continue }
+            for index in first...last {
+                let localStart = max(match.lowerBound - starts[index], 0)
+                let localEnd = min(match.upperBound - starts[index], texts[index].utf16.count)
+                // 空区间只在「整段都空」时出现（例如夹在命中中间的零长 run），跳过以免产生空改动
+                guard localStart < localEnd else { continue }
+                editsByText[index, default: []].append((localStart..<localEnd, index == first ? replaceWith : ""))
+            }
+        }
+
+        var edits: [Edit] = []
+        for (index, changes) in editsByText {
+            let mutable = NSMutableString(string: texts[index])
+            for change in changes.sorted(by: { $0.range.lowerBound > $1.range.lowerBound }) {
+                mutable.replaceCharacters(
+                    in: NSRange(location: change.range.lowerBound,
+                                length: change.range.upperBound - change.range.lowerBound),
+                    with: change.replacement)
+            }
+            edits.append(Edit(textIndex: index, newText: mutable as String))
+        }
+        return edits.sorted { $0.textIndex < $1.textIndex }
+    }
+
+    /// 返回命中在拼接字符串中的位置，单位为 **UTF-16 码元**，互不重叠
+    static func matchRanges(in text: String, find: String, options: ReplaceOptions) -> [Range<Int>] {
+        guard !find.isEmpty, !text.isEmpty else { return [] }
+        let haystack = text as NSString
+        var compareOptions: NSString.CompareOptions = [.literal]
+        if !options.caseSensitive { compareOptions.insert(.caseInsensitive) }
+
+        var ranges: [Range<Int>] = []
+        var location = 0
+        while location < haystack.length {
+            let searchRange = NSRange(location: location, length: haystack.length - location)
+            let found = haystack.range(of: find, options: compareOptions, range: searchRange)
+            guard found.location != NSNotFound else { break }
+            if !options.wholeWord || isWholeWordMatch(haystack, found) {
+                ranges.append(found.location..<(found.location + found.length))
+            }
+            location = found.location + max(found.length, 1)   // 至少前进 1，避免零长命中死循环
+        }
+        return ranges
+    }
+
+    /// 前后紧邻的码元是否都不是词字符。只检查边界那一个码元，不做任何索引运算。
+    private static func isWholeWordMatch(_ haystack: NSString, _ found: NSRange) -> Bool {
+        if found.location > 0 {
+            let before = NSRange(location: found.location - 1, length: 1)
+            if haystack.rangeOfCharacter(from: wordCharacters, range: before).location != NSNotFound {
+                return false
+            }
+        }
+        let afterStart = found.location + found.length
+        if afterStart < haystack.length {
+            let after = NSRange(location: afterStart, length: 1)
+            if haystack.rangeOfCharacter(from: wordCharacters, range: after).location != NSNotFound {
+                return false
+            }
+        }
+        return true
+    }
+}
+```
+
+**Step 3: 运行测试确认通过**
+
+```bash
+cd /Users/LB/Documents/AIProjects/DocxRepleace
+xcodebuild -project DocxReplace.xcodeproj -scheme DocxReplace -destination 'platform=macOS' test -only-testing:DocxReplaceTests/ParagraphMatcherTests 2>&1 | tail -25
+```
+
+Expected: `** TEST SUCCEEDED **`，25 个测试全部通过（20 原有 + 5 新增，原有的全部不得改动）。
+
+**Step 4: 运行全量测试并提交**
+
+```bash
+cd /Users/LB/Documents/AIProjects/DocxRepleace
+xcodebuild -project DocxReplace.xcodeproj -scheme DocxReplace -destination 'platform=macOS' test 2>&1 | tail -10
+git add DocxReplace/Core/ParagraphMatcher.swift DocxReplaceTests/ParagraphMatcherTests.swift
+git commit -m "fix: ParagraphMatcher 偏移改用 UTF-16 —— 修跨 run 字素簇改错文字与全字匹配崩溃"
+```
+
+Expected: 全量 75 个测试通过。
+
+---
+
 ## Task 9: 段落与分段结构分析
 
 **Files:**
