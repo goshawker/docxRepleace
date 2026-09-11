@@ -112,4 +112,35 @@ final class ParagraphMatcherTests: XCTestCase {
         XCTAssertTrue(ParagraphMatcher.replace(in: ["abc"], find: "zzz", replaceWith: "y",
                                                options: options).isEmpty)
     }
+
+    func testCombiningMarkSplitAcrossRuns() {
+        // "a" + 组合符 拼成一个字素簇：按 Character 计偏移会错位，必须按 UTF-16
+        let edits = ParagraphMatcher.replace(in: ["a", "\u{0301}b"], find: "b", replaceWith: "X",
+                                             options: options)
+        XCTAssertEqual(edits, [ParagraphMatcher.Edit(textIndex: 1, newText: "\u{0301}X")])
+    }
+
+    func testEmojiSkinToneSplitAcrossRuns() {
+        let edits = ParagraphMatcher.replace(in: ["👍", "🏽x"], find: "x", replaceWith: "X", options: options)
+        XCTAssertEqual(edits, [ParagraphMatcher.Edit(textIndex: 1, newText: "🏽X")])
+    }
+
+    func testWholeWordWithFlagEmojiDoesNotCrash() {
+        let opts = ReplaceOptions(caseSensitive: true, wholeWord: true)
+        XCTAssertEqual(ParagraphMatcher.matchRanges(in: "🇳🇨", find: "🇨", options: opts), [2..<4])
+    }
+
+    func testCountAndReplaceAgreeOnEmojiMatch() {
+        // 不能出现「计数 1 处，却一处都没改」
+        let texts = ["👍🏽"]
+        XCTAssertEqual(ParagraphMatcher.countMatches(in: texts, find: "👍", options: options), 1)
+        XCTAssertEqual(ParagraphMatcher.replace(in: texts, find: "👍", replaceWith: "X", options: options),
+                       [ParagraphMatcher.Edit(textIndex: 0, newText: "X🏽")])
+    }
+
+    func testEmptyRunInsideMatchProducesNoSpuriousEdit() {
+        let edits = ParagraphMatcher.replace(in: ["A", "", "B"], find: "AB", replaceWith: "X", options: options)
+        XCTAssertEqual(edits, [ParagraphMatcher.Edit(textIndex: 0, newText: "X"),
+                               ParagraphMatcher.Edit(textIndex: 2, newText: "")])
+    }
 }
