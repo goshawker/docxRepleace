@@ -4,10 +4,10 @@ enum DocxXmlError: Error, Equatable {
     case parseFailed(String)
     case nodeCountMismatch(dom: Int, raw: Int)
 
-    var message: String {
+    func message(_ s: AppStrings) -> String {
         switch self {
-        case .parseFailed(let detail): return "XML 解析失败：\(detail)"
-        case .nodeCountMismatch(let dom, let raw): return "文档结构异常（DOM \(dom) / 原始 \(raw)）"
+        case .parseFailed(let detail): return s.xmlParseFailed(detail: detail)
+        case .nodeCountMismatch(let dom, let raw): return s.xmlNodeCountMismatch(dom: dom, raw: raw)
         }
     }
 }

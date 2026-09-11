@@ -10,16 +10,16 @@ enum ZipError: Error, Equatable {
     case implausibleSize(String)
     case archiveTooLarge
 
-    var message: String {
+    func message(_ s: AppStrings) -> String {
         switch self {
-        case .notAZipFile: return "不是有效的 .docx 文件（可能是 .doc 或已损坏）"
-        case .zip64Unsupported: return "ZIP64 格式暂不支持"
-        case .unsupportedCompression(let method): return "不支持的压缩方式（\(method)）"
-        case .encryptedEntry(let name): return "文档已加密，无法读取（\(name)）"
-        case .corruptEntry(let name): return "文件结构损坏（\(name)）"
-        case .crcMismatch(let name): return "数据校验失败（\(name)）"
-        case .implausibleSize(let name): return "部件尺寸异常，已跳过（\(name)）"
-        case .archiveTooLarge: return "文档过大，超出 ZIP 格式上限"
+        case .notAZipFile: return s.zipNotAFile
+        case .zip64Unsupported: return s.zip64Unsupported
+        case .unsupportedCompression(let method): return s.zipUnsupportedCompression(method: method)
+        case .encryptedEntry(let name): return s.zipEncryptedEntry(name: name)
+        case .corruptEntry(let name): return s.zipCorruptEntry(name: name)
+        case .crcMismatch(let name): return s.zipCRCMismatch(name: name)
+        case .implausibleSize(let name): return s.zipImplausibleSize(name: name)
+        case .archiveTooLarge: return s.zipArchiveTooLarge
         }
     }
 }
@@ -63,14 +63,14 @@ struct ZipArchive {
             throw ZipError.zip64Unsupported
         }
         guard cdOffset >= 0, cdSize >= 0, cdOffset + cdSize <= bytes.count else {
-            throw ZipError.corruptEntry("中央目录越界")
+            throw ZipError.corruptEntry("central directory out of bounds")
         }
 
         var parsed: [ZipEntry] = []
         var p = cdOffset
         for _ in 0..<totalEntries {
             guard p + 46 <= bytes.count, Self.readU32(bytes, p) == 0x02014b50 else {
-                throw ZipError.corruptEntry("中央目录条目损坏")
+                throw ZipError.corruptEntry("central directory entry corrupt")
             }
             let flags = Self.readU16(bytes, p + 8)
             let method = Self.readU16(bytes, p + 10)
@@ -82,7 +82,7 @@ struct ZipArchive {
             let commentLen = Int(Self.readU16(bytes, p + 32))
             let localOffset = Self.readU32(bytes, p + 42)
             guard p + 46 + nameLen + extraLen + commentLen <= bytes.count else {
-                throw ZipError.corruptEntry("中央目录条目越界")
+                throw ZipError.corruptEntry("central directory entry out of bounds")
             }
             if compressedSize == 0xFFFFFFFF || uncompressedSize == 0xFFFFFFFF || localOffset == 0xFFFFFFFF {
                 throw ZipError.zip64Unsupported

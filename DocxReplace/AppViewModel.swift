@@ -9,6 +9,46 @@ enum Phase: Equatable {
     case finished
 }
 
+/// 状态栏文案的「语义值」：只存数据，渲染时才查当前语言的词表，
+/// 这样切换语言后已显示的状态行也能立即跟着变
+enum ViewStatus: Equatable {
+    case initial
+    case folderSelected(path: String)
+    case scanning
+    case scanningProgress(completed: Int, total: Int)
+    case scanCancelled
+    case noDocuments
+    case noMatch
+    case scanSummary(matchedFiles: Int, totalMatches: Int)
+    case replacing
+    case replacingProgress(completed: Int, total: Int)
+    case replaceSummary(cancelled: Bool, modifiedFiles: Int, replacedCount: Int,
+                        failedCount: Int, skippedCount: Int)
+
+    func text(_ s: AppStrings) -> String {
+        switch self {
+        case .initial: return s.statusInitial
+        case .folderSelected(let path): return s.statusFolderSelected(path: path)
+        case .scanning: return s.statusScanning
+        case .scanningProgress(let completed, let total):
+            return s.statusScanningProgress(completed: completed, total: total)
+        case .scanCancelled: return s.statusScanCancelled
+        case .noDocuments: return s.statusNoDocuments
+        case .noMatch: return s.statusNoMatch
+        case .scanSummary(let matchedFiles, let totalMatches):
+            return s.statusScanSummary(matchedFiles: matchedFiles, totalMatches: totalMatches)
+        case .replacing: return s.statusReplacing
+        case .replacingProgress(let completed, let total):
+            return s.statusReplacingProgress(completed: completed, total: total)
+        case .replaceSummary(let cancelled, let modifiedFiles, let replacedCount,
+                             let failedCount, let skippedCount):
+            return s.replaceSummary(cancelled: cancelled, modifiedFiles: modifiedFiles,
+                                    replacedCount: replacedCount, failedCount: failedCount,
+                                    skippedCount: skippedCount)
+        }
+    }
+}
+
 @MainActor
 final class AppViewModel: ObservableObject {
     @Published var folderURL: URL?
@@ -19,7 +59,7 @@ final class AppViewModel: ObservableObject {
     @Published var backupEnabled = true
     @Published var phase: Phase = .idle
     @Published var results: [FileScanResult] = []
-    @Published var statusText = "选择文件夹并输入查找内容"
+    @Published private(set) var status: ViewStatus = .initial
     @Published var progress: Double = 0
     @Published var currentFile = ""
     @Published var backupDirectory: URL?
@@ -28,6 +68,12 @@ final class AppViewModel: ObservableObject {
 
     private var runningTask: Task<Void, Never>?
     private var scannedFolder: URL?
+
+    /// 当前语言的词表。切换语言后 ContentView 会重绘，
+    /// statusText / validationMessage 随之按新词表重新渲染
+    var strings: AppStrings { Localization.shared.strings }
+
+    var statusText: String { status.text(strings) }
 
     var options: ReplaceOptions {
         ReplaceOptions(caseSensitive: caseSensitive, wholeWord: wholeWord)
@@ -45,12 +91,13 @@ final class AppViewModel: ObservableObject {
     }
 
     var validationMessage: String? {
-        if folderURL == nil { return "请先选择文件夹" }
-        if findText.isEmpty { return "请输入要查找的内容" }
-        if findText.contains("\n") || findText.contains("\r") { return "查找内容不能包含换行符" }
-        if replaceText.contains("\n") || replaceText.contains("\r") { return "替换内容不能包含换行符" }
-        if Self.hasIllegalControlCharacter(findText) { return "查找内容包含无法写入文档的控制字符" }
-        if Self.hasIllegalControlCharacter(replaceText) { return "替换内容包含无法写入文档的控制字符" }
+        let s = strings
+        if folderURL == nil { return s.validationNoFolder }
+        if findText.isEmpty { return s.validationEmptyFind }
+        if findText.contains("\n") || findText.contains("\r") { return s.validationFindHasNewline }
+        if replaceText.contains("\n") || replaceText.contains("\r") { return s.validationReplaceHasNewline }
+        if Self.hasIllegalControlCharacter(findText) { return s.validationFindIllegalControlCharacter }
+        if Self.hasIllegalControlCharacter(replaceText) { return s.validationReplaceIllegalControlCharacter }
         return nil
     }
 
@@ -67,12 +114,13 @@ final class AppViewModel: ObservableObject {
     var canReplace: Bool { validationMessage == nil && !isBusy && !matchedItems.isEmpty }
 
     func chooseFolder() {
+        let s = strings
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
-        panel.prompt = "选择"
-        panel.message = "选择要处理的文件夹"
+        panel.prompt = s.folderPanelPrompt
+        panel.message = s.folderPanelMessage
         guard panel.runModal() == .OK, let url = panel.url else { return }
         runningTask?.cancel()
         folderURL = url
@@ -81,23 +129,25 @@ final class AppViewModel: ObservableObject {
         phase = .idle
         progress = 0
         currentFile = ""
-        statusText = "已选择：\(url.path)"
+        status = .folderSelected(path: url.path)
     }
 
     func scan() {
         guard let folder = folderURL, validationMessage == nil else { return }
         let find = findText
         let options = self.options
+        let strings = self.strings
         phase = .scanning
         progress = 0
         currentFile = ""
-        statusText = "正在扫描…"
+        status = .scanning
         runningTask = Task { [weak self] in
-            let results = await ReplaceCoordinator.scan(folder: folder, find: find, options: options) { p in
+            let results = await ReplaceCoordinator.scan(folder: folder, find: find, options: options,
+                                                        strings: strings) { p in
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     self.progress = p.total == 0 ? 1 : Double(p.completed) / Double(p.total)
-                    self.statusText = "正在扫描 \(p.completed)/\(p.total)…"
+                    self.status = .scanningProgress(completed: p.completed, total: p.total)
                 }
             }
             guard let self else { return }
@@ -105,7 +155,7 @@ final class AppViewModel: ObservableObject {
                 // 取消后必须复位，否则界面会永远卡在「扫描中」
                 self.phase = .idle
                 self.progress = 0
-                self.statusText = "已取消扫描"
+                self.status = .scanCancelled
                 return
             }
             guard self.folderURL == folder else { return }   // 期间换过文件夹，丢弃这批结果
@@ -115,11 +165,11 @@ final class AppViewModel: ObservableObject {
             let matched = self.matchedItems.count
             self.progress = 1
             if results.isEmpty {
-                self.statusText = "文件夹中没有 .docx 或 .doc 文件"
+                self.status = .noDocuments
             } else if matched == 0 {
-                self.statusText = "没有找到匹配内容"
+                self.status = .noMatch
             } else {
-                self.statusText = "\(matched) 个文件命中，共 \(self.totalMatches) 处"
+                self.status = .scanSummary(matchedFiles: matched, totalMatches: self.totalMatches)
             }
         }
     }
@@ -137,20 +187,22 @@ final class AppViewModel: ObservableObject {
         let items = matchedItems
         let backup = backupEnabled
         let backupRoot = BackupManager.defaultRoot()
+        let strings = self.strings
 
         phase = .replacing
         progress = 0
-        statusText = "正在替换…"
+        status = .replacing
         runningTask = Task { [weak self] in
             let report = await ReplaceCoordinator.replace(items: items, sourceFolder: folder,
                                                           find: find, replaceWith: replaceWith,
                                                           options: options, backupEnabled: backup,
-                                                          backupRoot: backupRoot) { p in
+                                                          backupRoot: backupRoot,
+                                                          strings: strings) { p in
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     self.progress = p.total == 0 ? 1 : Double(p.completed) / Double(p.total)
                     self.currentFile = p.currentPath
-                    self.statusText = "正在处理 \(p.completed)/\(p.total)"
+                    self.status = .replacingProgress(completed: p.completed, total: p.total)
                 }
             }
             guard let self else { return }
@@ -158,16 +210,19 @@ final class AppViewModel: ObservableObject {
             self.phase = .finished
             self.progress = 1
             self.currentFile = ""
+            let s = self.strings
             if !report.failed.isEmpty {
-                let shown = report.failed.prefix(5).map { "\($0.path)：\($0.reason)" }.joined(separator: "\n")
-                let more = report.failed.count > 5 ? "\n…另有 \(report.failed.count - 5) 个" : ""
-                self.alertMessage = "\(report.failed.count) 个文件未处理：\n\(shown)\(more)"
+                let shown = report.failed.prefix(5)
+                    .map { s.failedFileLine(path: $0.path, reason: $0.reason) }
+                    .joined(separator: "\n")
+                let more = report.failed.count > 5 ? s.failedFilesAlertMore(count: report.failed.count - 5) : ""
+                self.alertMessage = s.failedFilesAlertHeader(count: report.failed.count) + "\n\(shown)\(more)"
             }
-            var summary = report.cancelled ? "已取消。" : ""
-            summary += "完成：修改 \(report.modifiedFiles) 个文件，共替换 \(report.replacedCount) 处"
-            if !report.failed.isEmpty { summary += "；\(report.failed.count) 个文件失败" }
-            if !report.skipped.isEmpty { summary += "；\(report.skipped.count) 个文件已无匹配" }
-            self.statusText = summary
+            self.status = .replaceSummary(cancelled: report.cancelled,
+                                          modifiedFiles: report.modifiedFiles,
+                                          replacedCount: report.replacedCount,
+                                          failedCount: report.failed.count,
+                                          skippedCount: report.skipped.count)
             self.rescanAfterReplace()
         }
     }
@@ -180,9 +235,11 @@ final class AppViewModel: ObservableObject {
         guard let folder = scannedFolder else { return }
         let find = findText
         let options = self.options
+        let strings = self.strings
         phase = .scanning
         runningTask = Task { [weak self] in
-            let results = await ReplaceCoordinator.scan(folder: folder, find: find, options: options) { _ in }
+            let results = await ReplaceCoordinator.scan(folder: folder, find: find, options: options,
+                                                        strings: strings) { _ in }
             guard let self else { return }
             guard !Task.isCancelled else {
                 // 这里也要复位，否则在「扫描中」取消会再次卡死界面

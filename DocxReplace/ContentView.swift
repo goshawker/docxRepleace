@@ -2,6 +2,9 @@ import SwiftUI
 
 struct ContentView: View {
     @StateObject private var model = AppViewModel()
+    @StateObject private var localization = Localization.shared
+
+    private var strings: AppStrings { localization.strings }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -11,15 +14,16 @@ struct ContentView: View {
             Divider()
             statusBar
         }
-        .alert("确认替换", isPresented: $model.showReplaceConfirmation) {
-            Button("取消", role: .cancel) {}
-            Button("开始替换") { model.confirmReplace() }
+        .alert(strings.confirmReplaceTitle, isPresented: $model.showReplaceConfirmation) {
+            Button(strings.cancelButton, role: .cancel) {}
+            Button(strings.startReplaceButton) { model.confirmReplace() }
         } message: {
-            Text("将修改 \(model.matchedItems.count) 个文件，共 \(model.totalMatches) 处。是否继续？")
+            Text(strings.confirmReplaceMessage(fileCount: model.matchedItems.count,
+                                               totalMatches: model.totalMatches))
         }
-        .alert("出错了", isPresented: Binding(get: { model.alertMessage != nil },
-                                             set: { if !$0 { model.alertMessage = nil } })) {
-            Button("好", role: .cancel) {}
+        .alert(strings.errorAlertTitle, isPresented: Binding(get: { model.alertMessage != nil },
+                                                             set: { if !$0 { model.alertMessage = nil } })) {
+            Button(strings.okButton, role: .cancel) {}
         } message: {
             Text(model.alertMessage ?? "")
         }
@@ -28,37 +32,38 @@ struct ContentView: View {
     private var form: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Text("文件夹").frame(width: 56, alignment: .trailing)
-                Text(model.folderURL?.path ?? "未选择")
+                Text(strings.folderLabel).frame(width: 56, alignment: .trailing)
+                Text(model.folderURL?.path ?? strings.notSelected)
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .foregroundStyle(model.folderURL == nil ? .secondary : .primary)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                Button("选择…") { model.chooseFolder() }
+                Button(strings.chooseButton) { model.chooseFolder() }
                     .disabled(model.isBusy)
+                languageMenu
             }
             HStack {
-                Text("查找").frame(width: 56, alignment: .trailing)
-                TextField("要查找的文字", text: $model.findText)
+                Text(strings.findLabel).frame(width: 56, alignment: .trailing)
+                TextField(strings.findPlaceholder, text: $model.findText)
             }
             HStack {
-                Text("替换为").frame(width: 56, alignment: .trailing)
-                TextField("替换成什么（可留空表示删除）", text: $model.replaceText)
+                Text(strings.replaceLabel).frame(width: 56, alignment: .trailing)
+                TextField(strings.replacePlaceholder, text: $model.replaceText)
             }
             HStack(spacing: 16) {
                 Spacer().frame(width: 56)
-                Toggle("区分大小写", isOn: $model.caseSensitive)
-                Toggle("全字匹配", isOn: $model.wholeWord)
-                Toggle("替换前备份", isOn: $model.backupEnabled)
+                Toggle(strings.caseSensitiveToggle, isOn: $model.caseSensitive)
+                Toggle(strings.wholeWordToggle, isOn: $model.wholeWord)
+                Toggle(strings.backupToggle, isOn: $model.backupEnabled)
             }
             HStack(spacing: 12) {
                 Spacer().frame(width: 56)
-                Button("扫描") { model.scan() }
+                Button(strings.scanButton) { model.scan() }
                     .disabled(!model.canScan)
-                Button("全部替换") { model.requestReplace() }
+                Button(strings.replaceAllButton) { model.requestReplace() }
                     .disabled(!model.canReplace)
                 if model.isBusy {
-                    Button("取消") { model.cancel() }
+                    Button(strings.cancelButton) { model.cancel() }
                 }
                 if let message = model.validationMessage, !model.isBusy {
                     Text(message).font(.caption).foregroundStyle(.secondary)
@@ -66,6 +71,21 @@ struct ContentView: View {
             }
         }
         .padding(14)
+    }
+
+    private var languageMenu: some View {
+        Menu {
+            Picker("", selection: $localization.language) {
+                Text(strings.followSystem).tag(AppLanguage.system)
+                ForEach(AppLanguage.allCases.filter { $0 != .system }) { lang in
+                    Text(lang.nativeName ?? lang.rawValue).tag(lang)
+                }
+            }
+            .pickerStyle(.inline)
+        } label: {
+            Image(systemName: "globe")
+        }
+        .accessibilityLabel(strings.languageMenuLabel)
     }
 
     private var resultList: some View {
@@ -88,7 +108,7 @@ struct ContentView: View {
                             }
                         }
                         if result.matchCount > result.previews.count {
-                            Text("…另有 \(result.matchCount - result.previews.count) 处未显示")
+                            Text(strings.overflowNotice(hiddenCount: result.matchCount - result.previews.count))
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -102,7 +122,7 @@ struct ContentView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .overlay {
             if model.results.isEmpty {
-                Text(model.isBusy ? "处理中…" : "扫描结果会显示在这里")
+                Text(model.isBusy ? strings.busyPlaceholder : strings.emptyResultsPlaceholder)
                     .foregroundStyle(.secondary)
             }
         }
@@ -135,10 +155,10 @@ struct ContentView: View {
                 if let backup = model.backupDirectory {
                     Text(backup.path).font(.caption).foregroundStyle(.secondary)
                         .lineLimit(1).truncationMode(.middle)
-                    Button("打开备份文件夹") { model.openBackupFolder() }
+                    Button(strings.openBackupFolderButton) { model.openBackupFolder() }
                 }
                 if model.folderURL != nil {
-                    Button("在访达中显示") { model.revealFolder() }
+                    Button(strings.revealInFinderButton) { model.revealFolder() }
                 }
             }
         }
@@ -170,8 +190,8 @@ struct ContentView: View {
 
     private func detail(for outcome: FileOutcome) -> String {
         switch outcome {
-        case .matched(let count): return "\(count) 处"
-        case .noMatch: return "0 处"
+        case .matched(let count): return strings.matchCount(count)
+        case .noMatch: return strings.matchCount(0)
         case .unsupported(let reason): return reason
         case .failed(let reason): return reason
         }

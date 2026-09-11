@@ -14,6 +14,7 @@ struct ReplaceProgress: Equatable {
 enum ReplaceCoordinator {
     /// 并行扫描（并发上限为 CPU 核数），返回按路径排序的结果
     static func scan(folder: URL, find: String, options: ReplaceOptions,
+                     strings: AppStrings = ChineseStrings(),
                      onProgress: @escaping (ScanProgress) -> Void) async -> [FileScanResult] {
         let items = FileScanner.scan(folder: folder)
         let total = items.count
@@ -29,7 +30,7 @@ enum ReplaceCoordinator {
             var next = 0
             while next < min(limit, total) {
                 let index = next
-                group.addTask { (index, analyze(items[index], find: find, options: options)) }
+                group.addTask { (index, analyze(items[index], find: find, options: options, strings: strings)) }
                 next += 1
             }
             while let (index, result) = await group.next() {
@@ -42,7 +43,7 @@ enum ReplaceCoordinator {
                 onProgress(ScanProgress(completed: completed, total: total))
                 if next < total {
                     let pending = next
-                    group.addTask { (pending, analyze(items[pending], find: find, options: options)) }
+                    group.addTask { (pending, analyze(items[pending], find: find, options: options, strings: strings)) }
                     next += 1
                 }
             }
@@ -53,6 +54,7 @@ enum ReplaceCoordinator {
     /// 串行替换；仅处理传入的条目。备份失败则跳过该文件
     static func replace(items: [ScanItem], sourceFolder: URL, find: String, replaceWith: String,
                         options: ReplaceOptions, backupEnabled: Bool, backupRoot: URL,
+                        strings: AppStrings = ChineseStrings(),
                         onProgress: @escaping (ReplaceProgress) -> Void) async -> ReplaceReport {
         var report = ReplaceReport()
         guard !items.isEmpty else { return report }
@@ -66,7 +68,8 @@ enum ReplaceCoordinator {
                 report.backupDirectory = runDirectory
             } catch {
                 report.failed.append(ReportedFile(path: sourceFolder.lastPathComponent,
-                                                  reason: "无法创建备份目录，已中止：\(error.localizedDescription)"))
+                                                  reason: strings.backupDirectoryFailed(
+                                                      detail: error.localizedDescription)))
                 return report
             }
         }
@@ -83,14 +86,14 @@ enum ReplaceCoordinator {
                 // .atomic 写入是「写临时文件再改名」，只要目录可写就能覆盖只读文件，
                 // 所以必须自己检查目标文件是否可写，并跳过
                 guard FileManager.default.isWritableFile(atPath: item.url.path) else {
-                    report.failed.append(ReportedFile(path: item.relativePath, reason: "文件不可写，已跳过"))
+                    report.failed.append(ReportedFile(path: item.relativePath, reason: strings.fileNotWritable))
                     continue
                 }
                 let (newData, count) = try DocxTextReplacer.replace(docxData: data, find: find,
                                                                     replaceWith: replaceWith,
                                                                     options: options)
                 guard count > 0 else {
-                    report.skipped.append(ReportedFile(path: item.relativePath, reason: "磁盘内容已无匹配"))
+                    report.skipped.append(ReportedFile(path: item.relativePath, reason: strings.diskNoMatch))
                     continue
                 }
                 if let runDirectory {
@@ -99,7 +102,8 @@ enum ReplaceCoordinator {
                                                  runDirectory: runDirectory)
                     } catch {
                         report.failed.append(ReportedFile(path: item.relativePath,
-                                                          reason: "备份失败，已跳过：\(error.localizedDescription)"))
+                                                          reason: strings.backupFailed(
+                                                              detail: error.localizedDescription)))
                         continue
                     }
                 }
@@ -108,17 +112,19 @@ enum ReplaceCoordinator {
                 report.replacedCount += count
             } catch {
                 report.failed.append(ReportedFile(path: item.relativePath,
-                                                  reason: describe(error, in: try? Data(contentsOf: item.url))))
+                                                  reason: describe(error, in: try? Data(contentsOf: item.url),
+                                                                   strings)))
             }
         }
         onProgress(ReplaceProgress(completed: total, total: total, currentPath: ""))
         return report
     }
 
-    private static func analyze(_ item: ScanItem, find: String, options: ReplaceOptions) -> FileScanResult {
+    private static func analyze(_ item: ScanItem, find: String, options: ReplaceOptions,
+                                strings: AppStrings) -> FileScanResult {
         switch item.kind {
         case .legacyDoc:
-            return FileScanResult(item: item, outcome: .unsupported("旧版 .doc 需先转为 .docx"))
+            return FileScanResult(item: item, outcome: .unsupported(strings.legacyDocument))
         case .docx:
             do {
                 let data = try Data(contentsOf: item.url)
@@ -132,25 +138,26 @@ enum ReplaceCoordinator {
                                       previews: previews)
             } catch {
                 return FileScanResult(item: item,
-                                      outcome: .failed(describe(error, in: try? Data(contentsOf: item.url))))
+                                      outcome: .failed(describe(error, in: try? Data(contentsOf: item.url),
+                                                                strings)))
             }
         }
     }
 
-    static func describe(_ error: Error) -> String {
-        if let zip = error as? ZipError { return zip.message }
-        if let xml = error as? DocxXmlError { return xml.message }
+    static func describe(_ error: Error, _ s: AppStrings) -> String {
+        if let zip = error as? ZipError { return zip.message(s) }
+        if let xml = error as? DocxXmlError { return xml.message(s) }
         return error.localizedDescription
     }
 
     /// `DocxXmlError` 不带部件名（Task 10b 审查跟进）；组装提示时补上出错部件，便于定位。
     /// 解析类错误可按 targetPartNames 顺序复走一遍回溯；仅在错误路径调用，代价可忽略。
     /// 改写阶段的 `nodeCountMismatch` 无法以同样方式回溯，退回通用提示。
-    private static func describe(_ error: Error, in data: Data?) -> String {
+    private static func describe(_ error: Error, in data: Data?, _ s: AppStrings) -> String {
         if let xml = error as? DocxXmlError, let data, let part = failingPart(in: data) {
-            return "\(part)：\(xml.message)"
+            return s.partMessage(part: part, message: xml.message(s))
         }
-        return describe(error)
+        return describe(error, s)
     }
 
     private static func failingPart(in data: Data) -> String? {
