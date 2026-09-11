@@ -869,10 +869,12 @@ final class ZipArchiveTests: XCTestCase {
     }
 
     /// 用系统 textutil 生成真实 docx
+    /// 注意：HTML 必须显式声明 charset，否则中文系统下 textutil 会按 GBK 解释，docx 内容成乱码
     static func makeRealDocx(text: String, into directory: URL) throws -> URL {
         let htmlURL = directory.appendingPathComponent("source.html")
         let docxURL = directory.appendingPathComponent("source.docx")
-        try "<html><body><p>\(text)</p></body></html>".write(to: htmlURL, atomically: true, encoding: .utf8)
+        try "<html><head><meta charset=\"utf-8\"></head><body><p>\(text)</p></body></html>"
+            .write(to: htmlURL, atomically: true, encoding: .utf8)
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/textutil")
         process.arguments = ["-convert", "docx", "-output", docxURL.path, htmlURL.path]
@@ -2614,7 +2616,12 @@ final class EndToEndTests: XCTestCase {
     private func makeDocx(html: String) throws -> Data {
         let htmlURL = tempDir.appendingPathComponent("in-\(UUID().uuidString).html")
         let docxURL = tempDir.appendingPathComponent("out-\(UUID().uuidString).docx")
-        try html.write(to: htmlURL, atomically: true, encoding: .utf8)
+        // 必须显式声明 charset：textutil 的 HTML 导入在中文系统下会按 GBK 解释，
+        // 不加这行会导致 docx 里的中文变成乱码
+        let htmlWithCharset = html.contains("charset")
+            ? html
+            : html.replacingOccurrences(of: "<html>", with: "<html><head><meta charset=\"utf-8\"></head>")
+        try htmlWithCharset.write(to: htmlURL, atomically: true, encoding: .utf8)
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/textutil")
         process.arguments = ["-convert", "docx", "-output", docxURL.path, htmlURL.path]
@@ -3561,8 +3568,8 @@ Expected: `** BUILD SUCCEEDED **`。
 ```bash
 cd /Users/LB/Documents/AIProjects/DocxRepleace
 mkdir -p /tmp/docx-manual-test/子目录
-printf '<html><body><p>北京某某科技有限公司</p><p>联系人：张三</p></body></html>' > /tmp/docx-manual-test/a.html
-printf '<html><body><p>本合同由北京某某科技有限公司签署</p></body></html>' > /tmp/docx-manual-test/b.html
+printf '<html><head><meta charset="utf-8"></head><body><p>北京某某科技有限公司</p><p>联系人：张三</p></body></html>' > /tmp/docx-manual-test/a.html
+printf '<html><head><meta charset="utf-8"></head><body><p>本合同由北京某某科技有限公司签署</p></body></html>' > /tmp/docx-manual-test/b.html
 /usr/bin/textutil -convert docx -output /tmp/docx-manual-test/合同A.docx /tmp/docx-manual-test/a.html
 /usr/bin/textutil -convert docx -output /tmp/docx-manual-test/子目录/合同B.docx /tmp/docx-manual-test/b.html
 /usr/bin/textutil -convert txt -stdout /tmp/docx-manual-test/合同A.docx
