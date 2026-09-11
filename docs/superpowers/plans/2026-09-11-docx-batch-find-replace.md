@@ -2473,9 +2473,38 @@ git commit -m "feat: 解析段落与分段结构，支持文本框嵌套段落�
 ## Task 10: `.docx` 替换主流程
 
 **Files:**
+- Modify: `DocxReplace/Core/ZipWriter.swift`（见 Step 0）
 - Create: `DocxReplace/Core/DocxTextReplacer.swift`
 - Create: `DocxReplaceTests/DocxFixture.swift`
 - Test: `DocxReplaceTests/DocxTextReplacerTests.swift`
+
+- [ ] **Step 0: 先修掉 Task 4 审查遗留的三处自洽性问题**
+
+这三处都是「我们写出的归档会被我们自己的读取器拒绝」，对真实 Word 文档不可达，但会让 Task 10 的「写出后回读校验」路径出现难以解释的失败，先修掉。
+
+1. `ZipWriter.build` 里的条目数上限：`entries.count <= Int(UInt16.max)` 允许写出 65535 条，
+   而 EOCD 的 `0xFFFF` 正是 zip64 哨兵，读取器会抛 `zip64Unsupported`。改成严格小于：
+
+```swift
+        guard entries.count < Int(UInt16.max) else { throw ZipError.archiveTooLarge }
+```
+
+2. `makeEntry` 与读取器的 `inflateLimit` 不对称：`contents.count > max(64 MiB, 256 × deflated.count)`
+   时读回来会被判 `implausibleSize`。让它退回 stored：
+
+```swift
+        if let deflated = ZipCompression.deflate(contents), deflated.count < contents.count, !contents.isEmpty,
+           contents.count <= max(64 * 1024 * 1024, deflated.count * 256) {
+            return ZipOutputEntry(name: name, dosTime: dosTime, dosDate: dosDate, method: 8,
+                                  crc32: crc, uncompressedSize: UInt32(contents.count),
+                                  externalAttributes: externalAttributes, compressedData: deflated)
+        }
+```
+
+3. 补两个测试到 `ZipArchiveTests.swift`：
+   - `testBuildRejectsExactlyUInt16MaxEntries`：65535 条应抛 `archiveTooLarge`
+   - `testMakeEntryRoundTripsThroughReader`：对空内容、不可压缩内容、高压缩比内容三种输入，
+     走 `makeEntry → build → ZipArchive.contents` 回读，断言与原文一致
 
 - [ ] **Step 1: 写夹具生成器 `DocxReplaceTests/DocxFixture.swift`**
 
@@ -2677,6 +2706,35 @@ final class DocxTextReplacerTests: XCTestCase {
         let after = try ZipArchive(data: out)
         let rawAfter = try after.rawData(of: try XCTUnwrap(after.entry(named: "_rels/.rels")))
         XCTAssertEqual(rawBefore, rawAfter)
+    }
+
+    /// 替换输出的归档必须能被外部工具接受 —— 这是 Task 10 的真实产物形态
+    func testRebuiltDocxIsAcceptedBySystemUnzip() throws {
+        let data = try DocxFixture.docx(bodyXML: DocxFixture.paragraph(["旧名"]))
+        let (out, _) = try DocxTextReplacer.replace(docxData: data, find: "旧名", replaceWith: "新名",
+                                                    options: options)
+        let url = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rebuilt-\(UUID().uuidString).zip")
+        try out.write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
+        process.arguments = ["-t", url.path]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        try process.run()
+        process.waitUntilExit()
+        let output = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        XCTAssertEqual(process.terminationStatus, 0, "替换产物应通过系统 unzip 校验：\(output)")
+
+        // 逐个条目回读，确认没有部件丢失或损坏
+        let archive = try ZipArchive(data: out)
+        XCTAssertEqual(archive.entries.count, try ZipArchive(data: data).entries.count)
+        for entry in archive.entries {
+            XCTAssertNoThrow(try archive.contents(of: entry), "条目应可读：\(entry.name)")
+        }
     }
 }
 ```
