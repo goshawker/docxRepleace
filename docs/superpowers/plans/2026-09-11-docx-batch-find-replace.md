@@ -2697,6 +2697,100 @@ Expected: 全量 75 个测试通过。
 
 ---
 
+## Task 7c: 全字匹配按「组合字符序列」判断（Task 7b 复核结论）
+
+**Files:**
+- Modify: `DocxReplace/Core/ParagraphMatcher.swift`
+- Modify: `DocxReplaceTests/ParagraphMatcherTests.swift`
+
+背景：Task 7b 把偏移改成 UTF-16 后，`isWholeWordMatch` 只检查**单个 UTF-16 码元**。非 BMP 字符（数学字母 `𝒜`、CJK 扩展 B 的 `𠀀`）在 UTF-16 里是代理对，单独一个码元是孤立代理项，不属于 `CharacterSet.letters`，于是被误判为非词字符、当成词边界：
+
+```swift
+ParagraphMatcher.replace(in: ["𝒜cat"], find: "cat", replaceWith: "X",
+                         options: ReplaceOptions(caseSensitive: true, wholeWord: true))
+// 现在返回 [Edit(0, "𝒜X")]，正确答案是 []（"cat" 在词 "𝒜cat" 内部）
+```
+
+CJK 扩展 B 区字符（`𠀀` 等）在中文文档里是可能出现的，必须修。改法：用 `rangeOfComposedCharacterSequence(at:)` 取该位置所在的**完整字符**，判断它的**第一个标量**是否为词字符。
+
+**Step 1: 追加失败测试到 `ParagraphMatcherTests.swift`**
+
+```swift
+    func testWholeWordRejectsMatchAfterNonBMPLetter() {
+        let opts = ReplaceOptions(caseSensitive: true, wholeWord: true)
+        XCTAssertEqual(ParagraphMatcher.countMatches(in: ["𝒜cat"], find: "cat", options: opts), 0)
+        XCTAssertTrue(ParagraphMatcher.replace(in: ["𝒜cat"], find: "cat", replaceWith: "X",
+                                               options: opts).isEmpty)
+        // CJK 扩展 B 区字符同理
+        XCTAssertEqual(ParagraphMatcher.countMatches(in: ["𠀀cat"], find: "cat", options: opts), 0)
+        XCTAssertEqual(ParagraphMatcher.countMatches(in: ["cat𝒜"], find: "cat", options: opts), 0)
+    }
+
+    func testWholeWordAcceptsMatchBesideNonWordEmoji() {
+        let opts = ReplaceOptions(caseSensitive: true, wholeWord: true)
+        XCTAssertEqual(ParagraphMatcher.countMatches(in: ["👍cat"], find: "cat", options: opts), 1)
+    }
+
+    func testWholeWordTreatsComposedLetterAsWordCharacter() {
+        let opts = ReplaceOptions(caseSensitive: true, wholeWord: true)
+        XCTAssertEqual(ParagraphMatcher.countMatches(in: ["e\u{0301}cat"], find: "cat", options: opts), 0)
+    }
+
+    func testWholeWordTreatsDecimalDigitAsWordCharacter() {
+        // 明确的取舍：十进制数字(Nd)算词字符；上标/罗马数字/分数(No/Nl，如 ①Ⅷ½)不算
+        let opts = ReplaceOptions(caseSensitive: true, wholeWord: true)
+        XCTAssertEqual(ParagraphMatcher.countMatches(in: ["1cat"], find: "cat", options: opts), 0)
+        XCTAssertEqual(ParagraphMatcher.countMatches(in: ["①cat"], find: "cat", options: opts), 1)
+    }
+```
+
+**Step 2: 改 `DocxReplace/Core/ParagraphMatcher.swift`**
+
+把词字符集合与整词判断替换为：
+
+```swift
+    /// 词字符集合：Unicode 字母（L*，含中日韩及扩展区）与十进制数字（Nd）。
+    /// 取舍：上标/罗马数字/分数（①Ⅷ½ 等 No/Nl 类）**不算**词字符。
+    private static let wordScalars = CharacterSet.letters.union(.decimalDigits)
+
+    /// 判断该 UTF-16 码元位置所在的**完整字符**是否为词字符。
+    /// 必须按组合字符序列判断，不能只看单个码元：非 BMP 字符（𝒜、𠀀）是代理对，
+    /// 孤立代理项不属于字母集，会被误判成词边界，从而把词内命中当成整词命中。
+    private static func isWordCharacter(_ haystack: NSString, at index: Int) -> Bool {
+        guard index >= 0, index < haystack.length else { return false }
+        let sequence = haystack.rangeOfComposedCharacterSequence(at: index)
+        guard let first = haystack.substring(with: sequence).unicodeScalars.first else { return false }
+        return wordScalars.contains(first)
+    }
+
+    private static func isWholeWordMatch(_ haystack: NSString, _ found: NSRange) -> Bool {
+        if isWordCharacter(haystack, at: found.location - 1) { return false }
+        if isWordCharacter(haystack, at: found.location + found.length) { return false }
+        return true
+    }
+```
+
+（原来的 `wordCharacters` 常量与逐码元写法一并删除；越界由 `isWordCharacter` 内的 guard 处理。）
+
+**Step 3: 运行测试确认通过**
+
+```bash
+cd /Users/LB/Documents/AIProjects/DocxRepleace
+xcodebuild -project DocxReplace.xcodeproj -scheme DocxReplace -destination 'platform=macOS' test 2>&1 | tail -20
+```
+
+Expected: `** TEST SUCCEEDED **`，全量 79 个测试通过（75 + 4 新增）。原有的 25 个 ParagraphMatcher 测试（含国旗 emoji 的 `[2..<4]`）必须继续通过。
+
+**Step 4: 提交**
+
+```bash
+cd /Users/LB/Documents/AIProjects/DocxRepleace
+git add DocxReplace/Core/ParagraphMatcher.swift DocxReplaceTests/ParagraphMatcherTests.swift
+git commit -m "fix: 全字匹配按组合字符序列判断，修非 BMP 字母旁的误命中"
+```
+
+---
+
 ## Task 9: 段落与分段结构分析
 
 **Files:**
