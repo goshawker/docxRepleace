@@ -1,6 +1,11 @@
 import Foundation
 
 enum BackupManager {
+    /// 备份目录名字前缀。FileScanner 靠它排除备份目录 ——
+    /// 应用若放在被扫描的文件夹内，备份就落在扫描范围内，而备份里是替换前的旧文字，
+    /// 不排除的话每轮扫描都会重新「找到」它们，替换永远做不完。
+    static let directoryNamePrefix = "DocxReplace备份"
+
     /// 优先 App 所在文件夹；不可写或位于 DerivedData（Xcode 直接运行）时退回 ~/Documents
     static func defaultRoot() -> URL {
         let appFolder = Bundle.main.bundleURL.deletingLastPathComponent()
@@ -17,7 +22,7 @@ enum BackupManager {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
         let run = root
-            .appendingPathComponent("DocxReplace备份_\(formatter.string(from: date))", isDirectory: true)
+            .appendingPathComponent("\(directoryNamePrefix)_\(formatter.string(from: date))", isDirectory: true)
             .appendingPathComponent(sourceFolder.lastPathComponent, isDirectory: true)
         try FileManager.default.createDirectory(at: run, withIntermediateDirectories: true)
         return run
