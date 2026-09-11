@@ -3074,7 +3074,9 @@ enum DocxXmlAnalyzer {
         func collectParagraphs(_ node: XMLNode) {
             if node.kind == .element, node.name == "w:p" {
                 walkParagraph(node)
-                return
+                // 注意：这里不能 return。文本框会产生嵌套在 run 里的 w:p，
+                // 必须继续下钻把它当成独立段落处理（walkParagraph 内部会跳过嵌套子树，
+                // 所以不会重复计数）。写成 return 的话文本框里的文字永远进不了 segments。
             }
             for child in node.children ?? [] {
                 collectParagraphs(child)
