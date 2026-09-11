@@ -1332,7 +1332,10 @@ git commit -m "feat: 实现 ZIP 读取与基础写出"
                                                       uncompressedSize: UInt32(payload.count),
                                                       externalAttributes: 0, compressedData: payload)])
         raw[6] |= 0x01
-        raw[raw.count - 22 + 8] |= 0x01
+        // 中央目录首条目的 flags 字节。不能用 raw.count - 22 + 8 —— 那是 EOCD 的条目数字段。
+        // EOCD 位于最后 22 字节，其 +16 处记录中央目录偏移，偏移 +8 才是首条目的 flags。
+        let cdOffset = Int(ZipArchive.readU32([UInt8](raw), raw.count - 22 + 16))
+        raw[cdOffset + 8] |= 0x01
         let archive = try ZipArchive(data: raw)
         let target = try XCTUnwrap(archive.entry(named: "e.txt"))
         XCTAssertThrowsError(try archive.contents(of: target)) { error in
@@ -1525,7 +1528,7 @@ cd /Users/LB/Documents/AIProjects/DocxRepleace
 xcodebuild -project DocxReplace.xcodeproj -scheme DocxReplace -destination 'platform=macOS' test -only-testing:DocxReplaceTests/ZipArchiveTests 2>&1 | tail -20
 ```
 
-Expected: `** TEST SUCCEEDED **`，14 个测试全部通过（其中 `testSystemUnzipAcceptsOurArchive` 证明我们产出的 ZIP 能被系统工具独立校验，`testReadsEntryWithDataDescriptor` 证明带描述符的归档能正确读取）。
+Expected: `** TEST SUCCEEDED **`，15 个测试全部通过（其中 `testSystemUnzipAcceptsOurArchive` 证明我们产出的 ZIP 能被系统工具独立校验，`testReadsEntryWithDataDescriptor` 证明带描述符的归档能正确读取）。
 
 - [ ] **Step 7: 提交**
 
