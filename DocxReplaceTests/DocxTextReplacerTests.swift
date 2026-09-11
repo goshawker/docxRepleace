@@ -138,6 +138,35 @@ final class DocxTextReplacerTests: XCTestCase {
         }
     }
 
+    func testPreviewsShowMatchContext() throws {
+        let data = try DocxFixture.docx(bodyXML: DocxFixture.paragraph(["前文甲旧名后文乙"]))
+        let previews = try DocxTextReplacer.previews(docxData: data, find: "旧名", options: options)
+        XCTAssertEqual(previews.count, 1)
+        XCTAssertEqual(previews[0].match, "旧名")
+        XCTAssertEqual(previews[0].before, "前文甲")
+        XCTAssertEqual(previews[0].after, "后文乙")
+        XCTAssertEqual(previews[0].part, "word/document.xml")
+    }
+
+    func testPreviewsTruncateLongContext() throws {
+        let long = String(repeating: "甲", count: 50) + "旧名" + String(repeating: "乙", count: 50)
+        let data = try DocxFixture.docx(bodyXML: DocxFixture.paragraph([long]))
+        let previews = try DocxTextReplacer.previews(docxData: data, find: "旧名", options: options)
+        XCTAssertEqual(previews[0].before, "…" + String(repeating: "甲", count: 12))
+        XCTAssertEqual(previews[0].after, String(repeating: "乙", count: 12) + "…")
+    }
+
+    func testPreviewsRespectLimit() throws {
+        let data = try DocxFixture.docx(bodyXML: DocxFixture.paragraph([String(repeating: "旧名", count: 20)]))
+        XCTAssertEqual(try DocxTextReplacer.previews(docxData: data, find: "旧名",
+                                                     options: options, limit: 3).count, 3)
+    }
+
+    func testPreviewsEmptyWhenNoMatch() throws {
+        let data = try DocxFixture.docx(bodyXML: DocxFixture.paragraph(["无关内容"]))
+        XCTAssertTrue(try DocxTextReplacer.previews(docxData: data, find: "旧名", options: options).isEmpty)
+    }
+
     func testRejectsDuplicateTargetPartNames() throws {
         // 手工拼一个含两个同名 document.xml 的归档（ZipWriter 允许重名）
         let inner = DocxFixture.documentXML(bodyXML: DocxFixture.paragraph(["旧名"]))

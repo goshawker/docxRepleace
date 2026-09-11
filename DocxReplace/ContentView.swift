@@ -70,18 +70,34 @@ struct ContentView: View {
 
     private var resultList: some View {
         List(model.results) { result in
-            HStack(spacing: 8) {
-                Image(systemName: icon(for: result.outcome))
-                    .foregroundStyle(color(for: result.outcome))
-                Text(result.relativePath)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                Spacer()
-                Text(detail(for: result.outcome))
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
+            if result.previews.isEmpty {
+                resultRow(result)
+            } else {
+                DisclosureGroup {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(Array(result.previews.enumerated()), id: \.offset) { _, preview in
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(preview.part)
+                                    .font(.caption2)
+                                    .foregroundStyle(.tertiary)
+                                (Text(preview.before)
+                                    + Text(preview.match).foregroundColor(.accentColor).bold()
+                                    + Text(preview.after))
+                                    .font(.callout)
+                                    .textSelection(.enabled)
+                            }
+                        }
+                        if result.matchCount > result.previews.count {
+                            Text("…另有 \(result.matchCount - result.previews.count) 处未显示")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(.vertical, 4)
+                } label: {
+                    resultRow(result)
+                }
             }
-            .opacity(isDimmed(result.outcome) ? 0.55 : 1)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .overlay {
@@ -90,6 +106,21 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
             }
         }
+    }
+
+    private func resultRow(_ result: FileScanResult) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: icon(for: result.outcome))
+                .foregroundStyle(color(for: result.outcome))
+            Text(result.relativePath)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer()
+            Text(detail(for: result.outcome))
+                .font(.callout)
+                .foregroundStyle(.secondary)
+        }
+        .opacity(isDimmed(result.outcome) ? 0.55 : 1)
     }
 
     private var statusBar: some View {

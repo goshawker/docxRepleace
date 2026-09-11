@@ -123,7 +123,13 @@ enum ReplaceCoordinator {
             do {
                 let data = try Data(contentsOf: item.url)
                 let count = try DocxTextReplacer.countMatches(docxData: data, find: find, options: options)
-                return FileScanResult(item: item, outcome: count > 0 ? .matched(count) : .noMatch)
+                // 预览失败不影响命中判定：预览只是辅助信息
+                let previews = count > 0
+                    ? (try? DocxTextReplacer.previews(docxData: data, find: find, options: options)) ?? []
+                    : []
+                return FileScanResult(item: item,
+                                      outcome: count > 0 ? .matched(count) : .noMatch,
+                                      previews: previews)
             } catch {
                 return FileScanResult(item: item,
                                       outcome: .failed(describe(error, in: try? Data(contentsOf: item.url))))

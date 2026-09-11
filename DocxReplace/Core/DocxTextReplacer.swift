@@ -42,6 +42,47 @@ enum DocxTextReplacer {
         return total
     }
 
+    /// 每处命中的前后文窗口（UTF-16 码元数）
+    static let previewContextLength = 12
+    /// 每个文件最多收集多少条预览
+    static let previewLimitPerFile = 8
+
+    /// 收集每个部件里前若干处命中的上下文。只读，不改文件。
+    static func previews(docxData: Data, find: String, options: ReplaceOptions,
+                         limit: Int = previewLimitPerFile) throws -> [MatchPreview] {
+        guard !find.isEmpty, limit > 0 else { return [] }
+        let archive = try ZipArchive(data: docxData)
+        var result: [MatchPreview] = []
+        for name in try targetPartNames(in: archive) {
+            guard result.count < limit else { break }
+            guard let entry = archive.entry(named: name) else { continue }
+            let analysis = try DocxXmlAnalyzer.analyze([UInt8](try archive.contents(of: entry)))
+            for segment in analysis.segments {
+                guard result.count < limit else { break }
+                let texts = segment.map { analysis.texts[$0] }
+                let joinedText = texts.joined()
+                let joined = joinedText as NSString
+                for range in ParagraphMatcher.matchRanges(in: joinedText, find: find, options: options) {
+                    guard result.count < limit else { break }
+                    let start = max(0, range.lowerBound - previewContextLength)
+                    let end = min(joined.length, range.upperBound + previewContextLength)
+                    var before = joined.substring(with: NSRange(location: start,
+                                                               length: range.lowerBound - start))
+                    var after = joined.substring(with: NSRange(location: range.upperBound,
+                                                              length: end - range.upperBound))
+                    if start > 0 { before = "…" + before }
+                    if end < joined.length { after += "…" }
+                    result.append(MatchPreview(part: name,
+                                               before: before,
+                                               match: joined.substring(with: NSRange(location: range.lowerBound,
+                                                                                     length: range.upperBound - range.lowerBound)),
+                                               after: after))
+                }
+            }
+        }
+        return result
+    }
+
     /// 返回新数据与实际替换处数；没有命中时原样返回输入数据
     static func replace(docxData: Data, find: String, replaceWith: String,
                         options: ReplaceOptions) throws -> (data: Data, replacedCount: Int) {

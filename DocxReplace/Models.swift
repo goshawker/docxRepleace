@@ -23,9 +23,18 @@ enum FileOutcome: Equatable {
     case failed(String)
 }
 
+/// 一处命中的上下文预览（前后各取若干字，便于用户确认到底命中了什么写法）
+struct MatchPreview: Equatable {
+    var part: String     // 部件名，如 "word/document.xml"
+    var before: String   // 命中前的文字（被截断时以 "…" 开头）
+    var match: String    // 实际命中的文字
+    var after: String    // 命中后的文字（被截断时以 "…" 结尾）
+}
+
 struct FileScanResult: Identifiable, Equatable {
     var item: ScanItem
     var outcome: FileOutcome
+    var previews: [MatchPreview] = []
 
     var id: String { item.relativePath }
     var relativePath: String { item.relativePath }

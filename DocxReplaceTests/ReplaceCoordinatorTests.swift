@@ -40,6 +40,14 @@ final class ReplaceCoordinatorTests: XCTestCase {
         XCTAssertEqual(noMatch?.outcome, .noMatch)
     }
 
+    func testScanAttachesPreviews() async {
+        let results = await ReplaceCoordinator.scan(folder: root, find: "北京公司",
+                                                    options: ReplaceOptions()) { _ in }
+        let matched = results.first { $0.matchCount > 0 }
+        XCTAssertEqual(matched?.previews.count, 1)
+        XCTAssertEqual(matched?.previews.first?.match, "北京公司")
+    }
+
     func testScanProgressReachesTotal() async {
         // 并发扫描时进度回调来自多个线程，只断言「见过的最大值」
         final class MaxTracker: @unchecked Sendable {
