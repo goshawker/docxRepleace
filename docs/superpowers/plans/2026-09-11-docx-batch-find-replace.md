@@ -1910,6 +1910,20 @@ git commit -m "feat: 实现 w:t 元素的字节级定位与实体编解码"
         let xml = "<w:t>原样</w:t>"
         XCTAssertEqual(rebuild(xml, edits: [:]), xml)
     }
+
+    func testIgnoresCloseTagInsideCDATA() {
+        let xml = "<w:t><![CDATA[a</w:t>b]]></w:t>"
+        let result = nodes(xml)
+        XCTAssertEqual(result.count, 1)
+        XCTAssertEqual(result[0].text, "a</w:t>b")
+        let bytes = [UInt8](xml.utf8)
+        XCTAssertEqual(String(decoding: bytes[result[0].innerStart..<result[0].innerEnd], as: UTF8.self),
+                       "<![CDATA[a</w:t>b]]>")
+    }
+
+    func testDecodesMixedCDATAContent() {
+        XCTAssertEqual(nodes("<w:t>pre<![CDATA[<&]]>post</w:t>")[0].text, "pre<&post")
+    }
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -1964,21 +1978,97 @@ Expected: 编译失败，`type 'XmlTextLocator' has no member 'rebuild'`。
     }
 ```
 
-- [ ] **Step 4: 运行测试确认通过**
+- [ ] **Step 4: 顺带修掉 CDATA 内含 `</w:t` 的解析缺陷**
+
+Task 5 的代码审查发现：`<w:t><![CDATA[a</w:t>b]]></w:t>` 这种输入下，第 57 行的
+`find(xml, from: innerStart, utf8: "</w:t")` 会把 CDATA 里的字节当成结束标签，
+导致 `innerEnd` 偏小、`text` 错误。Task 9 的「DOM 节点数 vs 原始节点数」校验**拦不住它**（两边都是 1 个节点），
+而 Task 6 的 `rebuild` 按 `elementStart..<elementEnd` 重新生成整个元素，会写出**无法解析的 XML**。
+真实 Word/WPS/Google Docs 都不会产出这种输入，但既然这个文件本轮就要改，顺手堵上。
+
+把 `findTextNodes` 中查找结束标签的那一行：
+
+```swift
+                guard let closeStart = find(xml, from: innerStart, utf8: "</w:t") else { break }
+```
+
+改为调用新的单趟扫描函数：
+
+```swift
+                guard let closeStart = findCloseTag(xml, from: innerStart) else { break }
+```
+
+在 `findTextNodes` 之后新增这个函数（单趟扫描，内部跳过 CDATA；不要写成对每个元素再扫一遍 CDATA，
+那会退化成 O(n²)）：
+
+```swift
+    /// 找到 w:t 的结束标签位置，单趟扫描并跳过内部的 CDATA 段（其中可能含 "</w:t" 字节）
+    private static func findCloseTag(_ xml: [UInt8], from index: Int) -> Int? {
+        var i = index
+        while i < xml.count {
+            if xml[i] == 0x3C {                                  // '<'
+                if matches(xml, at: i, utf8: "</w:t") { return i }
+                if matches(xml, at: i, utf8: "<![CDATA[") {
+                    guard let end = find(xml, from: i + 9, utf8: "]]>") else { return nil }
+                    i = end + 3
+                    continue
+                }
+            }
+            i += 1
+        }
+        return nil
+    }
+```
+
+再把 `decodeText` 换成逐段解码版本（普通文本走实体解码，CDATA 段原样保留），
+替换掉原来「只有整段被 CDATA 包裹才剥壳」的写法：
+
+```swift
+    private static func decodeText(_ bytes: [UInt8]) -> String {
+        var out = ""
+        var i = 0
+        while i < bytes.count {
+            if matches(bytes, at: i, utf8: "<![CDATA[") {
+                guard let end = find(bytes, from: i + 9, utf8: "]]>") else {
+                    out += String(decoding: bytes[i...], as: UTF8.self)
+                    break
+                }
+                out += String(decoding: bytes[(i + 9)..<end], as: UTF8.self)
+                i = end + 3
+            } else if let next = find(bytes, from: i, utf8: "<![CDATA[") {
+                out += unescape(String(decoding: bytes[i..<next], as: UTF8.self))
+                i = next
+            } else {
+                out += unescape(String(decoding: bytes[i...], as: UTF8.self))
+                break
+            }
+        }
+        return out
+    }
+```
+
+最后把 `TextNode.attributes` 的注释补全（现有注释只说「含前导空白」，实际尾部空白也保留，
+而 `rebuild` 会原样拼回去，必须有说明，免得后人「顺手」裁剪）：
+
+```swift
+        var attributes: String   // "<w:t" 之后、">" 或 "/" 之前的原文，首尾空白均原样保留，rebuild 会原样拼回
+```
+
+- [ ] **Step 5: 运行测试确认通过**
 
 ```bash
 cd /Users/LB/Documents/AIProjects/DocxRepleace
 xcodebuild -project DocxReplace.xcodeproj -scheme DocxReplace -destination 'platform=macOS' test -only-testing:DocxReplaceTests/XmlTextLocatorTests 2>&1 | tail -20
 ```
 
-Expected: `** TEST SUCCEEDED **`，19 个测试全部通过。
+Expected: `** TEST SUCCEEDED **`，21 个测试全部通过。
 
-- [ ] **Step 5: 提交**
+- [ ] **Step 6: 提交**
 
 ```bash
 cd /Users/LB/Documents/AIProjects/DocxRepleace
 git add DocxReplace/Core/XmlTextLocator.swift DocxReplaceTests/XmlTextLocatorTests.swift
-git commit -m "feat: w:t 文字改写，含 xml:space 补写与实体转义"
+git commit -m "feat: w:t 文字改写，含 xml:space 补写与实体转义；修正 CDATA 内结束标签误判"
 ```
 
 ---
@@ -2275,7 +2365,11 @@ import XCTest
 
 final class DocxXmlAnalyzerTests: XCTestCase {
     private func analyze(_ xml: String) throws -> DocxXmlAnalyzer.PartAnalysis {
-        try DocxXmlAnalyzer.analyze([UInt8](xml.utf8))
+        // XMLDocument 不接受未声明的命名空间前缀（报 "Namespace prefix w ... is not defined"），
+        // 所以测试片段必须包一层声明了 xmlns:w 的根元素，否则所有用例都会在解析阶段失败
+        let wrapped = "<w:doc xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">"
+            + xml + "</w:doc>"
+        return try DocxXmlAnalyzer.analyze([UInt8](wrapped.utf8))
     }
 
     func testSingleParagraph() throws {
@@ -2793,7 +2887,7 @@ enum DocxTextReplacer {
         let archive = try ZipArchive(data: docxData)
         let targets = Set(targetPartNames(in: archive))
 
-        var partEdits: [String: (edits: [Int: String], count: Int)] = [:]
+        var partEdits: [String: (xml: [UInt8], edits: [Int: String], count: Int)] = [:]
         for name in targets {
             guard let entry = archive.entry(named: name) else { continue }
             let xml = [UInt8](try archive.contents(of: entry))
@@ -2809,7 +2903,7 @@ enum DocxTextReplacer {
                 }
             }
             if count > 0 {
-                partEdits[name] = (edits, count)
+                partEdits[name] = (xml, edits, count)
             }
         }
         guard !partEdits.isEmpty else { return (docxData, 0) }
@@ -2818,8 +2912,10 @@ enum DocxTextReplacer {
         var total = 0
         for entry in archive.entries {
             if let changed = partEdits[entry.name] {
-                let xml = [UInt8](try archive.contents(of: entry))
-                let newXML = XmlTextLocator.rebuild(xml: xml, edits: changed.edits)
+                let newXML = XmlTextLocator.rebuild(xml: changed.xml, edits: changed.edits)
+                // 最后一道防线：改写后的 XML 必须仍能被完整解析。
+                // 宁可整份文件报错跳过，也不能写出 Word 打不开的文档。
+                _ = try XMLDocument(data: Data(newXML), options: [])
                 outputs.append(ZipWriter.makeEntry(name: entry.name, contents: Data(newXML),
                                                    date: Date(),
                                                    externalAttributes: entry.externalAttributes))
