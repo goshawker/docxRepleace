@@ -3146,6 +3146,45 @@ git commit -m "feat: 解析段落与分段结构，支持文本框嵌套段落�
    - `testMakeEntryRoundTripsThroughReader`：对空内容、不可压缩内容、高压缩比内容三种输入，
      走 `makeEntry → build → ZipArchive.contents` 回读，断言与原文一致
 
+**另外两处 Task 9 审查提出的静默失败，一并堵掉**（都在 `DocxXmlAnalyzer.swift`）：
+
+4. `analyze` 目前校验了 `w:t` 总数，但没校验**每个序号都被分配到了某个分段**。
+   若某个 `w:t` 不在任何 `w:p` 内（Word 不会产出，但第三方工具可能有），它会留在 `texts` 里
+   却不在 `segments` 中，于是被静默跳过、既不报错也不处理。加一段覆盖校验：
+
+```swift
+        let assigned = segments.reduce(0) { $0 + $1.count }
+        guard assigned == textNodes.count else {
+            throw DocxXmlError.nodeCountMismatch(dom: textNodes.count, raw: assigned)
+        }
+```
+
+5. `indexByNode[ObjectIdentifier(node)]` 查不到时是静默 `return`（同属静默遗漏）。改为响亮：
+
+```swift
+                if node.name == "w:t" {
+                    if let index = indexByNode[ObjectIdentifier(node)] {
+                        current.append(index)
+                    } else {
+                        assertionFailure("w:t 节点未在序号表中，枚举逻辑出现分歧")
+                    }
+                    return
+                }
+```
+
+6. 给 `PartAnalysis.segments` 补一句注释，说明**分段顺序不等于全局序号顺序**
+   （父段落的分段先于其文本框内嵌套段落的分段），Task 10 按序号取用、不依赖顺序：
+
+```swift
+        /// 每个片段包含的 w:t 全局序号。
+        /// 注意：顺序不保证按序号升序 —— 父段落的分段会先于其文本框内嵌套段落的分段输出。
+        var segments: [[Int]]
+```
+
+7. 再补两个测试到 `DocxXmlAnalyzerTests.swift`：
+   - `testOrphanTextOutsideParagraphFailsLoudly`：把 `<w:t>游离</w:t>` 放在 `<w:p>` 之外，断言抛错
+   - `testThrowsOnMalformedNestedStructure`：`<w:p><w:r><w:t>甲</w:t></w:r><w:p>`（未闭合）应抛错
+
 - [ ] **Step 1: 写夹具生成器 `DocxReplaceTests/DocxFixture.swift`**
 
 ```swift
