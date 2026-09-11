@@ -44,9 +44,10 @@
 
 可用系统能力（已验证）：
 
-- `zlib`：SDK 内提供 `/usr/include/zlib.h` 与 `libz.tbd`，可做 DEFLATE/INFLATE 与 CRC32。
+- `Compression` 框架：可直接在 Swift 中 `import`，其 `COMPRESSION_ZLIB` 产出的正是 ZIP 所需的 raw DEFLATE 流（RFC 1951），无需桥接头文件。
 - `XMLDocument`（Foundation，macOS 专有）：完整 DOM 解析器。
-- `Compression` 框架、`textutil`（仅用于测试夹具生成与验证）。
+- `textutil`、`unzip`（仅用于测试夹具生成与独立校验）。
+- `zlib` 头文件与 `libz.tbd` 也在 SDK 内可用，但需要 Objective-C 桥接头，故不采用。
 
 ### 4.2 `.docx` 处理路线：自研保真引擎（方案 A）
 
@@ -131,9 +132,9 @@ Word 会把一段连续文字拆成多个 run（拼写检查、格式变化、�
 
 ### 5.3 ZIP 层
 
-自研实现，基于系统 zlib：
+自研实现，基于系统 `Compression` 框架 + 自写 CRC32：
 
-- **读**：解析 EOCD → 中央目录 → 各条目。支持 stored(0) 与 deflate(8)。压缩数据用 `inflate`（raw deflate，windowBits=-15）。尺寸取自中央目录（兼容带 data descriptor 的条目）。检测 zip64 并给出明确报错。
+- **读**：解析 EOCD → 中央目录 → 各条目。支持 stored(0) 与 deflate(8)。压缩数据用 `compression_decode_buffer`（`COMPRESSION_ZLIB`，即 raw deflate）。尺寸取自中央目录（兼容带 data descriptor 的条目）。检测 zip64 并给出明确报错。
 - **写**：**未修改的条目直接拷贝原始压缩字节**（不重新压缩，保证内容字节级一致）；被修改的部件用 `deflate` 重新压缩并更新 CRC32 与尺寸。重建中央目录与 EOCD。
 - 若读取失败（损坏、加密），返回明确错误类型。
 
@@ -243,7 +244,7 @@ Word 会把一段连续文字拆成多个 run（拼写检查、格式变化、�
 | 结构 | `DocxReplace.xcodeproj` + `DocxReplace/`（App 源码）+ `DocxReplaceTests/`（单元测试） |
 | 工程格式 | Xcode 16+ 同步文件夹（`PBXFileSystemSynchronizedRootGroup`），源码文件放入目录即自动纳入编译 |
 | 部署目标 | macOS 14.0 |
-| 语言 | Swift 6 语言模式 |
+| 语言 | Swift 5 语言模式（Swift 6.3 编译器），避免严格并发检查带来的摩擦 |
 | App Sandbox | 关闭（本地自用，避免权限与 entitlement 复杂度） |
 | 硬化运行时 | 关闭 |
 | 签名 | Sign to Run Locally（`CODE_SIGN_IDENTITY = "-"`），无需开发者账号 |
