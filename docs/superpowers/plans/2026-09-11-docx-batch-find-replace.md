@@ -2453,7 +2453,7 @@ Task 7 已经实现了 `replace`，本任务用测试把它钉死。
 
     func testReplaceWithLongerText() {
         let edits = ParagraphMatcher.replace(in: ["abc"], find: "b", replaceWith: "BETA", options: options)
-        XCTAssertEqual(edits, [ParagraphMatcher.Edit(textIndex: 0, newText: "aBETA c".replacingOccurrences(of: " ", with: ""))])
+        XCTAssertEqual(edits, [ParagraphMatcher.Edit(textIndex: 0, newText: "aBETAc")])
     }
 
     func testReplaceWithEmptyStringDeletes() {
@@ -2466,9 +2466,12 @@ Task 7 已经实现了 `replace`，本任务用测试把它钉死。
         XCTAssertEqual(edits, [ParagraphMatcher.Edit(textIndex: 0, newText: "new-new")])
     }
 
-    func testReplaceMultipleMatchesAcrossSameRuns() {
+    func testReplaceMatchSpanningTwoRunsEditsBoth() {
+        // joined = "abab"，"ba" 命中 [1,3)，横跨 run0 的 'b' 与 run1 的 'a'，
+        // 因此两个 run 都必须重写（run1 若不动，残留的 'a' 会留下）
         let edits = ParagraphMatcher.replace(in: ["ab", "ab"], find: "ba", replaceWith: "X", options: options)
-        XCTAssertEqual(edits, [ParagraphMatcher.Edit(textIndex: 0, newText: "aX")])
+        XCTAssertEqual(edits, [ParagraphMatcher.Edit(textIndex: 0, newText: "aX"),
+                               ParagraphMatcher.Edit(textIndex: 1, newText: "b")])
     }
 
     func testReplaceSkipsEmptySegments() {
@@ -2493,8 +2496,6 @@ Task 7 已经实现了 `replace`，本任务用测试把它钉死。
     }
 ```
 
-注意 `testReplaceWithLongerText` 的期望值写成 `"aBETAc"`，直接写字符串字面量即可，不要用 `replacingOccurrences`。
-
 - [ ] **Step 2: 运行测试**
 
 ```bash
@@ -2502,7 +2503,7 @@ cd /Users/LB/Documents/AIProjects/DocxRepleace
 xcodebuild -project DocxReplace.xcodeproj -scheme DocxReplace -destination 'platform=macOS' test -only-testing:DocxReplaceTests/ParagraphMatcherTests 2>&1 | tail -30
 ```
 
-Expected: 全部通过（`** TEST SUCCEEDED **`）。若 `testReplaceMultipleMatchesAcrossSameRuns` 失败，检查 `matchRanges` 是否把 `"abab"` 中位置 1 的 `"ba"` 也算进去了——正确答案是只有 1 处（从 0 开始第 1 处命中后，搜索从命中末尾继续，剩下 `"ab"` 不含 `"ba"`）。
+Expected: 全部通过（`** TEST SUCCEEDED **`）。若某个「跨 run」用例失败，先确认 `matchRanges` 的非重叠语义没写错：`"abab"` 中 `"ba"` 只有 1 处——第 1 处命中后搜索从命中末尾继续，剩下的 `"ab"` 不含 `"ba"`。
 
 - [ ] **Step 3: 提交**
 
