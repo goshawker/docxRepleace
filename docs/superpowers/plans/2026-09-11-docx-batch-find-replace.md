@@ -4677,6 +4677,207 @@ git commit -m "feat: SwiftUI 界面，完成扫描-确认-替换-报告全流程
 
 ---
 
+## Task 14b: 界面状态机与写入安全（最终审查结论）
+
+**Files:**
+- Modify: `DocxReplace/AppViewModel.swift`
+- Modify: `DocxReplace/ContentView.swift`
+- Modify: `DocxReplace/Core/ReplaceCoordinator.swift`
+- Modify: `DocxReplaceTests/ReplaceCoordinatorTests.swift`
+
+最终审查用对抗性测试复现了三个 Important 缺陷（都在此前未独立复核过的界面/编排层）：
+
+1. **扫描中取消会让应用永久卡死**：`scan()` 的任务在 await 之后有 `guard let self, !Task.isCancelled else { return }`，取消时直接返回，`phase` 永远停在 `.scanning`，两个按钮一直禁用，只能靠重新选文件夹逃出来。而且 `ReplaceCoordinator.scan` 内部没有取消检查，取消后任务仍会跑完再丢弃结果。
+2. **扫描中切换文件夹会把替换打到错误的文件夹**：`chooseFolder()` 不取消正在跑的扫描，扫描完成时也不校验文件夹是否还是当前选中的。实测：选 B 后列表里仍是 A 的文件，此时点「全部替换」会以 B 作为源目录去改 A 的文件；又因为 `BackupManager.backup` 的 `relativePath` 前缀匹配不上（`fileURL` 不在 B 下），备份退化成裸文件名，不同子目录下的同名文件会互相覆盖备份。
+3. **只读文件被静默修改**：`Data.write(options: [.atomic])` 是「写临时文件 + 改名」，只要**目录**可写就能覆盖只读文件。实测 0444 的文件被改掉，且 `failed` 为空、无任何提示。设计 §8 承诺「无权限 → 跳过该文件，报告中列明」。
+4. 另外：替换的逐文件失败原因被算出来却没展示（`rescanAfterReplace` 用新扫描结果覆盖了列表），用户不知道是哪些文件失败了。
+
+**Step 1: 追加失败测试到 `ReplaceCoordinatorTests.swift`**
+
+```swift
+    func testReadOnlyFileIsSkippedAndReported() async throws {
+        let file = root.appendingPathComponent("只读.docx")
+        try DocxFixture.docx(bodyXML: DocxFixture.paragraph(["旧名"])).write(to: file)
+        try FileManager.default.setAttributes([.posixPermissions: 0o444], ofItemAtPath: file.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: file.path) }
+
+        let results = await ReplaceCoordinator.scan(folder: root, find: "旧名",
+                                                    options: ReplaceOptions()) { _ in }
+        let items = results.filter { $0.matchCount > 0 }.map(\.item)
+        let report = await ReplaceCoordinator.replace(items: items, sourceFolder: root,
+                                                      find: "旧名", replaceWith: "新名",
+                                                      options: ReplaceOptions(), backupEnabled: true,
+                                                      backupRoot: root.appendingPathComponent("备份")) { _ in }
+        let readOnlyReport = report.failed.first { $0.path == "只读.docx" }
+        XCTAssertNotNil(readOnlyReport, "只读文件必须出现在失败列表中")
+        XCTAssertTrue(readOnlyReport?.reason.contains("不可写") ?? false)
+
+        // 内容必须原封不动
+        let data = try Data(contentsOf: file)
+        XCTAssertEqual(try DocxTextReplacer.countMatches(docxData: data, find: "旧名",
+                                                         options: ReplaceOptions()), 1)
+    }
+```
+
+**Step 2: 改 `DocxReplace/Core/ReplaceCoordinator.swift`**
+
+（a）在 `replace` 的循环里，读取之后、备份之前加可写性检查：
+
+```swift
+                let data = try Data(contentsOf: item.url)
+                // .atomic 写入是「写临时文件再改名」，只要目录可写就能覆盖只读文件，
+                // 所以必须自己检查目标文件是否可写，并跳过
+                guard FileManager.default.isWritableFile(atPath: item.url.path) else {
+                    report.failed.append(ReportedFile(path: item.relativePath, reason: "文件不可写，已跳过"))
+                    continue
+                }
+                let (newData, count) = try DocxTextReplacer.replace(...)
+```
+
+（b）`scan` 支持取消：在任务组取结果的循环里加取消检查，并在取消时停止派发新任务：
+
+```swift
+            while let (index, result) = await group.next() {
+                if Task.isCancelled {
+                    group.cancelAll()
+                    break
+                }
+                collected[index] = result
+                ...
+            }
+```
+
+（c）「已无匹配」记入 `skipped`（设计中 §6.2 要求记录）：
+
+```swift
+                guard count > 0 else {
+                    report.skipped.append(ReportedFile(path: item.relativePath, reason: "磁盘内容已无匹配"))
+                    continue
+                }
+```
+
+**Step 3: 改 `DocxReplace/AppViewModel.swift`**
+
+（a）新增 `scannedFolder`，让「替换」永远作用于**产生这批结果的**那个文件夹：
+
+```swift
+    private var scannedFolder: URL?
+```
+
+`chooseFolder()` 里清空它，并在切换文件夹时取消正在跑的任务：
+
+```swift
+        runningTask?.cancel()
+        folderURL = url
+        scannedFolder = nil
+        results = []
+        phase = .idle
+        progress = 0
+        currentFile = ""
+        statusText = "已选择：\(url.path)"
+```
+
+`scan()` 的任务结尾改为：
+
+```swift
+            guard let self else { return }
+            guard !Task.isCancelled else {
+                // 取消后必须复位，否则界面会永远卡在「扫描中」
+                self.phase = .idle
+                self.progress = 0
+                self.statusText = "已取消扫描"
+                return
+            }
+            guard self.folderURL == folder else { return }   // 期间换过文件夹，丢弃这批结果
+            self.results = results
+            self.scannedFolder = folder
+            ...
+```
+
+（b）`confirmReplace()` 改用 `scannedFolder` 作为源目录（保证「谁扫描、谁被改」）：
+
+```swift
+    func confirmReplace() {
+        guard let folder = scannedFolder else { return }
+        ...
+    }
+```
+
+（c）替换完成后把逐文件失败原因显示出来（而不是只报个数）：
+
+```swift
+            guard let self else { return }
+            self.backupDirectory = report.backupDirectory
+            self.phase = .finished
+            self.progress = 1
+            self.currentFile = ""
+            if !report.failed.isEmpty {
+                let shown = report.failed.prefix(5).map { "\($0.path)：\($0.reason)" }.joined(separator: "\n")
+                let more = report.failed.count > 5 ? "\n…另有 \(report.failed.count - 5) 个" : ""
+                self.alertMessage = "\(report.failed.count) 个文件未处理：\n\(shown)\(more)"
+            }
+            var summary = report.cancelled ? "已取消。" : ""
+            summary += "完成：修改 \(report.modifiedFiles) 个文件，共替换 \(report.replacedCount) 处"
+            if !report.failed.isEmpty { summary += "；\(report.failed.count) 个文件失败" }
+            if !report.skipped.isEmpty { summary += "；\(report.skipped.count) 个文件已无匹配" }
+            self.statusText = summary
+            self.rescanAfterReplace()
+```
+
+（d）`rescanAfterReplace` 期间标记为 `.scanning`，避免与手动扫描并发；结束时复位：
+
+```swift
+    private func rescanAfterReplace() {
+        guard let folder = scannedFolder else { return }
+        let find = findText
+        let options = self.options
+        phase = .scanning
+        runningTask = Task { [weak self] in
+            let results = await ReplaceCoordinator.scan(folder: folder, find: find, options: options) { _ in }
+            guard let self, !Task.isCancelled else { return }
+            self.results = results
+            self.phase = .finished
+        }
+    }
+```
+
+**Step 4: 改 `DocxReplace/ContentView.swift`**
+
+- 「选择…」按钮在忙时禁用：`.disabled(model.isBusy)`（从根上避免扫描中切换文件夹）
+- 状态栏显示实际备份路径文本：
+
+```swift
+                if let backup = model.backupDirectory {
+                    Text(backup.path).font(.caption).foregroundStyle(.secondary)
+                        .lineLimit(1).truncationMode(.middle)
+                    Button("打开备份文件夹") { model.openBackupFolder() }
+                }
+```
+
+**Step 5: 运行测试确认通过**
+
+```bash
+cd /Users/LB/Documents/AIProjects/DocxRepleace
+xcodebuild -project DocxReplace.xcodeproj -scheme DocxReplace -destination 'platform=macOS' test 2>&1 | tail -20
+```
+
+Expected: `** TEST SUCCEEDED **`，全量 122 个测试通过。
+
+**Step 6: 手工验证取消不再卡死**
+
+用 `/tmp/docx-manual-test`（若已被替换过，先按 Task 14 的 Step 4 重新生成），启动应用，
+选文件夹 → 点「扫描」→ 立刻点「取消」→ 确认按钮恢复可用、状态栏显示「已取消扫描」。
+
+**Step 7: 提交**
+
+```bash
+cd /Users/LB/Documents/AIProjects/DocxRepleace
+git add DocxReplace DocxReplaceTests
+git commit -m "fix: 修界面状态机三处缺陷（取消卡死、扫描期间换文件夹、只读文件被覆盖）"
+```
+
+---
+
 ## Task 15: 收尾验证
 
 **Files:**
