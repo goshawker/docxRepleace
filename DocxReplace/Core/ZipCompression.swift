@@ -19,11 +19,15 @@ enum ZipCompression {
         return output
     }
 
-    /// raw DEFLATE 解压。expectedSize 来自 ZIP 中央目录
+    /// raw DEFLATE 解压。expectedSize 来自 ZIP 中央目录。
+    ///
+    /// 关键：`compression_decode_buffer` 在缓冲区不足时**不报错**，而是返回已解出的
+    /// 字节数（即截断）。因此初始容量取 `expectedSize + 1`，并且只接受「未填满缓冲区」
+    /// 的结果——否则会把截断的数据当作完整结果返回。
     static func inflate(_ data: Data, expectedSize: Int) -> Data? {
         guard !data.isEmpty else { return expectedSize == 0 ? Data() : nil }
         guard expectedSize > 0 else { return nil }
-        var capacity = expectedSize
+        var capacity = expectedSize + 1
         for _ in 0..<5 {
             var output = Data(count: capacity)
             let written = output.withUnsafeMutableBytes { dst -> Int in
@@ -33,11 +37,9 @@ enum ZipCompression {
                     return compression_decode_buffer(dstBase, capacity, srcBase, data.count, nil, COMPRESSION_ZLIB)
                 }
             }
-            if written > 0 {
-                if written < capacity || written == expectedSize {
-                    output.removeSubrange(written...)
-                    return output
-                }
+            if written > 0, written < capacity {
+                output.removeSubrange(written...)
+                return output
             }
             capacity = capacity * 4 + 64
         }
