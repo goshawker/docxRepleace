@@ -3543,6 +3543,104 @@ Expected: 全量 106 个测试通过（91 + Step 0 的 4 个 + 本任务的 11 �
 
 ---
 
+## Task 10b: 拒绝重名部件（Task 10 审查结论）
+
+**Files:**
+- Modify: `DocxReplace/Core/DocxTextReplacer.swift`
+- Modify: `DocxReplaceTests/DocxTextReplacerTests.swift`
+
+背景：审查发现，若归档里有两个同名目标部件（如两个 `word/document.xml`，Word 不会产出，但第三方压缩工具可能）：
+
+- `partEdits` 只按 `entry(named:)` 取**第一个**条目计算
+- 写出循环却对**每一个**同名条目应用同一份改写结果 → 第二个条目被整体覆盖（命中范围之外的字节也变了）
+- `total += changed.count` 每个同名条目都加一次 → 计数翻倍
+- 反向情形：只有第二个条目命中时，两个 API 都报 0 并原样返回输入 → 静默漏改
+
+修法：在 `targetPartNames` 里检测重名并响亮报错。这样两个入口（`countMatches` 与 `replace`）同时被堵住。
+
+**Step 1: 追加失败测试到 `DocxTextReplacerTests.swift`**
+
+```swift
+    func testRejectsDuplicateTargetPartNames() throws {
+        // 手工拼一个含两个同名 document.xml 的归档（ZipWriter 允许重名）
+        let inner = DocxFixture.documentXML(bodyXML: DocxFixture.paragraph(["旧名"]))
+        let entries = [
+            ZipWriter.makeEntry(name: "[Content_Types].xml",
+                                contents: Data(DocxFixture.contentTypesForTest.utf8),
+                                date: Date(timeIntervalSince1970: 0)),
+            ZipWriter.makeEntry(name: "word/document.xml", contents: Data(inner.utf8),
+                                date: Date(timeIntervalSince1970: 0)),
+            ZipWriter.makeEntry(name: "word/document.xml", contents: Data(inner.utf8),
+                                date: Date(timeIntervalSince1970: 0)),
+        ]
+        let data = try ZipWriter.build(entries)
+        XCTAssertThrowsError(try DocxTextReplacer.countMatches(docxData: data, find: "旧名",
+                                                               options: options)) { error in
+            XCTAssertEqual(error as? ZipError, .corruptEntry("word/document.xml 在归档中重复出现"))
+        }
+        XCTAssertThrowsError(try DocxTextReplacer.replace(docxData: data, find: "旧名",
+                                                          replaceWith: "新名", options: options))
+    }
+```
+
+把 `DocxFixture` 里生成 `[Content_Types].xml` 的私有方法 `contentTypes(extraParts:)` 改名为 `contentTypesForTest` 并去掉 `private`（或者直接在测试里内联一段最小的 content types 字符串——二选一，哪个改动小用哪个）。
+
+**Step 2: 改 `DocxReplace/Core/DocxTextReplacer.swift`**
+
+`targetPartNames` 改为 `throws` 并检测重名：
+
+```swift
+    static func targetPartNames(in archive: ZipArchive) throws -> [String] {
+        var names: [String] = []
+        for entry in archive.entries where isTargetPart(entry.name) {
+            if names.contains(entry.name) {
+                // 重名会让「按名取第一个」与「按名改写全部」错位：第二个条目会被整体覆盖，
+                // 计数也会翻倍。Word 不会产出，但第三方工具可能，必须响亮失败。
+                throw ZipError.corruptEntry("\(entry.name) 在归档中重复出现")
+            }
+            names.append(entry.name)
+        }
+        return names
+    }
+
+    /// 目标部件：正文、页眉、页脚、脚注、尾注、批注
+    private static func isTargetPart(_ name: String) -> Bool {
+        if name == "word/document.xml" { return true }
+        if name == "word/footnotes.xml" || name == "word/endnotes.xml" || name == "word/comments.xml" {
+            return true
+        }
+        guard name.hasPrefix("word/"), !name.dropFirst(5).contains("/") else { return false }
+        let file = String(name.dropFirst(5))
+        return (file.hasPrefix("header") || file.hasPrefix("footer")) && file.hasSuffix(".xml")
+    }
+```
+
+两处调用改为 `try`：`countMatches` 里的 `for name in try targetPartNames(in: archive)`，
+`replace` 里的 `let targets = Set(try targetPartNames(in: archive))`。
+
+**Step 3: 运行测试确认通过**
+
+```bash
+cd /Users/LB/Documents/AIProjects/DocxRepleace
+xcodebuild -project DocxReplace.xcodeproj -scheme DocxReplace -destination 'platform=macOS' test 2>&1 | tail -20
+```
+
+Expected: `** TEST SUCCEEDED **`，全量 107 个测试通过。
+
+**Step 4: 提交**
+
+```bash
+cd /Users/LB/Documents/AIProjects/DocxRepleace
+git add DocxReplace/Core/DocxTextReplacer.swift DocxReplaceTests
+git commit -m "fix: 拒绝归档中的重名目标部件，避免覆盖与计数翻倍"
+```
+
+**留给 Task 13 的两点**（审查提出，不改本任务）：
+- `DocxXmlError` 不带部件名，`ReplaceReport.failed` 的提示会缺少定位信息；Task 13 组装错误信息时把部件名带上
+- `countMatches` 与 `replace` 各自重复了「解压 → 分析」的循环，Task 13 若同时需要两者可考虑合并
+
+---
+
 ## Task 11: 真实文档端到端测试
 
 **Files:**
