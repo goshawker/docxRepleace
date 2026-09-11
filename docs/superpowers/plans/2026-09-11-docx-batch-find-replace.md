@@ -899,7 +899,7 @@ final class ZipArchiveTests: XCTestCase {
                                    crc32: ZipCRC32.checksum(payload),
                                    uncompressedSize: UInt32(payload.count),
                                    externalAttributes: 0, compressedData: payload)
-        let archive = try ZipArchive(data: ZipWriter.build([entry]))
+        let archive = try ZipArchive(data: try ZipWriter.build([entry]))
         XCTAssertEqual(try archive.contents(of: try XCTUnwrap(archive.entry(named: "a.txt"))), payload)
     }
 
@@ -910,7 +910,7 @@ final class ZipArchiveTests: XCTestCase {
                                    crc32: ZipCRC32.checksum(payload),
                                    uncompressedSize: UInt32(payload.count),
                                    externalAttributes: 0, compressedData: compressed)
-        let archive = try ZipArchive(data: ZipWriter.build([entry]))
+        let archive = try ZipArchive(data: try ZipWriter.build([entry]))
         XCTAssertEqual(try archive.contents(of: try XCTUnwrap(archive.entry(named: "dir/b.txt"))), payload)
     }
 
@@ -923,7 +923,7 @@ final class ZipArchiveTests: XCTestCase {
         let entry = ZipOutputEntry(name: "c.txt", dosTime: 0, dosDate: 0, method: 0,
                                    crc32: 0xDEADBEEF, uncompressedSize: UInt32(payload.count),
                                    externalAttributes: 0, compressedData: payload)
-        let archive = try ZipArchive(data: ZipWriter.build([entry]))
+        let archive = try ZipArchive(data: try ZipWriter.build([entry]))
         XCTAssertThrowsError(try archive.contents(of: try XCTUnwrap(archive.entry(named: "c.txt"))))
     }
 }
@@ -1200,15 +1200,37 @@ git commit -m "feat: 实现 ZIP 读取与基础写出"
 
 ---
 
-## Task 4: ZIP 写出的完整性
+## Task 4: ZIP 层加固与写出完整性
 
 **Files:**
-- Modify: `DocxReplace/Core/ZipWriter.swift`
+- Modify: `DocxReplace/Core/ZipArchive.swift`（解压尺寸上限）
+- Modify: `DocxReplace/Core/ZipWriter.swift`（`makeEntry` / `copyEntry` / `dosDateTime`；`build` 改为 `throws` 并防 UInt32 截断）
 - Modify: `DocxReplaceTests/ZipArchiveTests.swift`
 
-- [ ] **Step 1: 追加失败测试到 `DocxReplaceTests/ZipArchiveTests.swift`**
+**为什么这一步要加固（Task 3 代码审查的结论，均为计划层面的缺陷）：**
 
-在 `ZipArchiveTests` 类中追加：
+1. **损坏文件头可触发失控分配**：`inflate` 以 `expectedSize + 1` 起步、失败后 ×4 递增地申请内存。中央目录若声称解压后有 `0xFFFFFFFE` 字节，会依次尝试分配 4 GB → 17 GB → 69 GB → 275 GB → 1100 GB，表现为整机卡死或被系统杀掉，而不是设计要求的「报告并跳过」。
+2. **`build` 会静默写出截断偏移**：`UInt32(out.count)` 在归档总长超过 4 GB 时溢出，产出的中央目录偏移是错的 —— 正是最需要避免的「静默损坏」。
+
+两处都必须变成**响亮的失败**。
+
+- [ ] **Step 1: 先把 Task 3 遗留的 3 处调用改成 `try`**
+
+`DocxReplaceTests/ZipArchiveTests.swift` 中 `testStoredEntryRoundTrip`、`testDeflatedEntryRoundTrip`、`testDetectsCRCMismatch` 三处：
+
+```swift
+        let archive = try ZipArchive(data: try ZipWriter.build([entry]))
+```
+
+改为：
+
+```swift
+        let archive = try ZipArchive(data: try ZipWriter.build([entry]))
+```
+
+- [ ] **Step 2: 追加失败测试到 `DocxReplaceTests/ZipArchiveTests.swift`**
+
+在 `ZipArchiveTests` 类中追加（`appendLE16`/`appendLE32` 放到文件末尾、类外，用 `private`）：
 
 ```swift
     func testMakeEntryChoosesDeflateWhenSmaller() {
@@ -1241,7 +1263,7 @@ git commit -m "feat: 实现 ZIP 读取与基础写出"
         let outputs = try original.entries.map { entry -> ZipOutputEntry in
             ZipWriter.copyEntry(entry, raw: try original.rawData(of: entry))
         }
-        let rebuilt = try ZipArchive(data: ZipWriter.build(outputs))
+        let rebuilt = try ZipArchive(data: try ZipWriter.build(outputs))
         let targetAfter = try XCTUnwrap(rebuilt.entry(named: "word/document.xml"))
         XCTAssertEqual(try rebuilt.rawData(of: targetAfter), rawBefore, "未改动条目必须字节级一致")
     }
@@ -1266,18 +1288,200 @@ git commit -m "feat: 实现 ZIP 读取与基础写出"
         let output = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
         XCTAssertEqual(process.terminationStatus, 0, "系统 unzip 应能读取我们写出的 zip：\(output)")
     }
+
+    /// 中央目录声称解压后有 4 GB，必须在申请内存之前拒绝
+    func testRejectsImplausibleUncompressedSize() throws {
+        let payload = Data("small".utf8)
+        let compressed = try XCTUnwrap(ZipCompression.deflate(payload))
+        let entry = ZipOutputEntry(name: "bomb.xml", dosTime: 0, dosDate: 0, method: 8,
+                                   crc32: ZipCRC32.checksum(payload),
+                                   uncompressedSize: 0xFFFFFFFE,
+                                   externalAttributes: 0, compressedData: compressed)
+        let archive = try ZipArchive(data: try ZipWriter.build([entry]))
+        let target = try XCTUnwrap(archive.entry(named: "bomb.xml"))
+        XCTAssertThrowsError(try archive.contents(of: target)) { error in
+            XCTAssertEqual(error as? ZipError, .implausibleSize("bomb.xml"))
+        }
+    }
+
+    func testBuildRejectsOversizedEntryCount() {
+        let entries = (0...Int(UInt16.max)).map { index in
+            ZipOutputEntry(name: "f\(index)", dosTime: 0, dosDate: 0, method: 0, crc32: 0,
+                           uncompressedSize: 0, externalAttributes: 0, compressedData: Data())
+        }
+        XCTAssertThrowsError(try ZipWriter.build(entries)) { error in
+            XCTAssertEqual(error as? ZipError, .archiveTooLarge)
+        }
+    }
+
+    func testRejectsUnsupportedCompressionMethod() throws {
+        let entry = ZipOutputEntry(name: "m12.bin", dosTime: 0, dosDate: 0, method: 12, crc32: 0,
+                                   uncompressedSize: 0, externalAttributes: 0, compressedData: Data([1, 2, 3]))
+        let archive = try ZipArchive(data: try ZipWriter.build([entry]))
+        let target = try XCTUnwrap(archive.entry(named: "m12.bin"))
+        XCTAssertThrowsError(try archive.contents(of: target)) { error in
+            XCTAssertEqual(error as? ZipError, .unsupportedCompression(12))
+        }
+    }
+
+    func testRejectsEncryptedEntry() throws {
+        let payload = Data("secret".utf8)
+        // 手工置位加密标志（bit 0）
+        var raw = try ZipWriter.build([ZipOutputEntry(name: "e.txt", dosTime: 0, dosDate: 0, method: 0,
+                                                      crc32: ZipCRC32.checksum(payload),
+                                                      uncompressedSize: UInt32(payload.count),
+                                                      externalAttributes: 0, compressedData: payload)])
+        raw[6] |= 0x01
+        raw[raw.count - 22 + 8] |= 0x01
+        let archive = try ZipArchive(data: raw)
+        let target = try XCTUnwrap(archive.entry(named: "e.txt"))
+        XCTAssertThrowsError(try archive.contents(of: target)) { error in
+            XCTAssertEqual(error as? ZipError, .encryptedEntry("e.txt"))
+        }
+    }
+
+    func testEmptyArchiveHasNoEntries() throws {
+        let archive = try ZipArchive(data: try ZipWriter.build([]))
+        XCTAssertTrue(archive.entries.isEmpty)
+        XCTAssertNil(archive.entry(named: "anything"))
+    }
+
+    /// 手工构造带 data descriptor（标志位 3）的归档：本地头里的 crc/尺寸为 0，
+    /// 真实值写在数据之后的描述符里，中央目录才是权威来源
+    func testReadsEntryWithDataDescriptor() throws {
+        let payload = Data("descriptor payload 内容".utf8)
+        let compressed = try XCTUnwrap(ZipCompression.deflate(payload))
+        let crc = ZipCRC32.checksum(payload)
+        let name = Array("dd.txt".utf8)
+
+        var out = Data()
+        appendLE32(&out, 0x04034b50)
+        appendLE16(&out, 20)
+        appendLE16(&out, 0x0008)
+        appendLE16(&out, 8)
+        appendLE16(&out, 0); appendLE16(&out, 0)
+        appendLE32(&out, 0)
+        appendLE32(&out, 0); appendLE32(&out, 0)
+        appendLE16(&out, UInt16(name.count)); appendLE16(&out, 0)
+        out.append(contentsOf: name)
+        out.append(compressed)
+        appendLE32(&out, 0x08074b50)
+        appendLE32(&out, crc)
+        appendLE32(&out, UInt32(compressed.count))
+        appendLE32(&out, UInt32(payload.count))
+
+        let cdOffset = UInt32(out.count)
+        appendLE32(&out, 0x02014b50)
+        appendLE16(&out, 20); appendLE16(&out, 20)
+        appendLE16(&out, 0x0008)
+        appendLE16(&out, 8)
+        appendLE16(&out, 0); appendLE16(&out, 0)
+        appendLE32(&out, crc)
+        appendLE32(&out, UInt32(compressed.count))
+        appendLE32(&out, UInt32(payload.count))
+        appendLE16(&out, UInt16(name.count)); appendLE16(&out, 0); appendLE16(&out, 0)
+        appendLE16(&out, 0); appendLE16(&out, 0)
+        appendLE32(&out, 0)
+        appendLE32(&out, 0)
+        out.append(contentsOf: name)
+        let cdSize = UInt32(out.count) - cdOffset
+
+        appendLE32(&out, 0x06054b50)
+        appendLE16(&out, 0); appendLE16(&out, 0)
+        appendLE16(&out, 1); appendLE16(&out, 1)
+        appendLE32(&out, cdSize); appendLE32(&out, cdOffset)
+        appendLE16(&out, 0)
+
+        let archive = try ZipArchive(data: out)
+        let entry = try XCTUnwrap(archive.entry(named: "dd.txt"))
+        XCTAssertEqual(try archive.contents(of: entry), payload)
+        XCTAssertEqual(try archive.rawData(of: entry), compressed, "描述符不得混进原始压缩字节")
+    }
+}
+
+private func appendLE16(_ data: inout Data, _ value: UInt16) {
+    data.append(UInt8(value & 0xFF))
+    data.append(UInt8((value >> 8) & 0xFF))
+}
+
+private func appendLE32(_ data: inout Data, _ value: UInt32) {
+    data.append(UInt8(value & 0xFF))
+    data.append(UInt8((value >> 8) & 0xFF))
+    data.append(UInt8((value >> 16) & 0xFF))
+    data.append(UInt8((value >> 24) & 0xFF))
+}
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [ ] **Step 3: 运行测试确认失败**
 
 ```bash
 cd /Users/LB/Documents/AIProjects/DocxRepleace
 xcodebuild -project DocxReplace.xcodeproj -scheme DocxReplace -destination 'platform=macOS' test -only-testing:DocxReplaceTests/ZipArchiveTests 2>&1 | tail -20
 ```
 
-Expected: 编译失败，`type 'ZipWriter' has no member 'makeEntry'` / `'copyEntry'`。
+Expected: 编译失败，`type 'ZipWriter' has no member 'makeEntry'` / `'copyEntry'`，以及 `no member 'archiveTooLarge'`。
 
-- [ ] **Step 3: 在 `DocxReplace/Core/ZipWriter.swift` 的 `ZipWriter` 内追加**
+- [ ] **Step 4: 改 `DocxReplace/Core/ZipArchive.swift`**
+
+在 `ZipError` 中加两个 case，并补上对应的 `message`：
+
+```swift
+    case implausibleSize(String)
+    case archiveTooLarge
+```
+
+```swift
+        case .implausibleSize(let name): return "部件尺寸异常，已跳过（\(name)）"
+        case .archiveTooLarge: return "文档过大，超出 ZIP 格式上限"
+```
+
+在 `contents(of:)` 的 `case 8:` 分支里，**在调用 inflate 之前**加上限判断：
+
+```swift
+        case 8:
+            guard Int(entry.uncompressedSize) <= Self.inflateLimit(compressedSize: entry.compressedSize) else {
+                throw ZipError.implausibleSize(entry.name)
+            }
+            guard let inflated = ZipCompression.inflate(raw, expectedSize: Int(entry.uncompressedSize)) else {
+                throw ZipError.corruptEntry(entry.name)
+            }
+            out = inflated
+```
+
+并在 `ZipArchive` 内加一个私有静态方法：
+
+```swift
+    /// 解压尺寸上限：至少 64 MiB，或压缩数据的 256 倍。
+    /// 防止损坏或恶意的 uncompressedSize 触发失控的内存分配。
+    private static func inflateLimit(compressedSize: UInt32) -> Int {
+        max(64 * 1024 * 1024, Int(compressedSize) * 256)
+    }
+```
+
+- [ ] **Step 5: 改 `DocxReplace/Core/ZipWriter.swift`**
+
+把 `build` 改成 `throws` 并在三处加护栏（入口的条目数、每个条目的名字长度、每次偏移计算前）：
+
+```swift
+    static func build(_ entries: [ZipOutputEntry]) throws -> Data {
+        guard entries.count <= Int(UInt16.max) else { throw ZipError.archiveTooLarge }
+        var out = Data()
+        var central = Data()
+        for entry in entries {
+            guard out.count < Int(UInt32.max) else { throw ZipError.archiveTooLarge }
+            let nameBytes = Array(entry.name.utf8)
+            guard nameBytes.count <= Int(UInt16.max) else { throw ZipError.archiveTooLarge }
+            let offset = UInt32(out.count)
+            let flags: UInt16 = nameBytes.contains { $0 >= 0x80 } ? 0x0800 : 0
+            // ...（中间写本地头与数据的部分保持不变）...
+        }
+        guard out.count < Int(UInt32.max) else { throw ZipError.archiveTooLarge }
+        let cdOffset = UInt32(out.count)
+        // ...（其余保持不变）...
+    }
+```
+
+再在 `ZipWriter` 内追加：
 
 ```swift
     /// 用未压缩内容构造条目，自动选择 deflate 或 stored
@@ -1314,21 +1518,21 @@ Expected: 编译失败，`type 'ZipWriter' has no member 'makeEntry'` / `'copyEn
     }
 ```
 
-- [ ] **Step 4: 运行测试确认通过**
+- [ ] **Step 6: 运行测试确认通过**
 
 ```bash
 cd /Users/LB/Documents/AIProjects/DocxRepleace
 xcodebuild -project DocxReplace.xcodeproj -scheme DocxReplace -destination 'platform=macOS' test -only-testing:DocxReplaceTests/ZipArchiveTests 2>&1 | tail -20
 ```
 
-Expected: `** TEST SUCCEEDED **`，9 个测试全部通过（其中 `testSystemUnzipAcceptsOurArchive` 证明我们产出的 ZIP 能被系统工具独立校验）。
+Expected: `** TEST SUCCEEDED **`，14 个测试全部通过（其中 `testSystemUnzipAcceptsOurArchive` 证明我们产出的 ZIP 能被系统工具独立校验，`testReadsEntryWithDataDescriptor` 证明带描述符的归档能正确读取）。
 
-- [ ] **Step 5: 提交**
+- [ ] **Step 7: 提交**
 
 ```bash
 cd /Users/LB/Documents/AIProjects/DocxRepleace
-git add DocxReplace/Core/ZipWriter.swift DocxReplaceTests/ZipArchiveTests.swift
-git commit -m "feat: ZIP 写出支持自动压缩选择与原样拷贝，通过系统 unzip 校验"
+git add DocxReplace/Core/ZipArchive.swift DocxReplace/Core/ZipWriter.swift DocxReplaceTests/ZipArchiveTests.swift
+git commit -m "feat: ZIP 写出完整性 + 两处安全护栏（解压尺寸上限、归档大小溢出）"
 ```
 
 ---
@@ -2278,7 +2482,7 @@ import Foundation
 
 /// 用自研 ZIP 层拼出结构合法的 .docx，用于测试
 enum DocxFixture {
-    static func docx(bodyXML: String, extraParts: [(String, String)] = []) -> Data {
+    static func docx(bodyXML: String, extraParts: [(String, String)] = []) throws -> Data {
         var parts: [(String, String)] = [
             ("[Content_Types].xml", contentTypes(extraParts: extraParts.map(\.0))),
             ("_rels/.rels", rootRels),
@@ -2288,7 +2492,7 @@ enum DocxFixture {
         let entries = parts.map {
             ZipWriter.makeEntry(name: $0.0, contents: Data($0.1.utf8), date: Date(timeIntervalSince1970: 0))
         }
-        return ZipWriter.build(entries)
+        return try ZipWriter.build(entries)
     }
 
     static func paragraph(_ runs: [String]) -> String {
@@ -2374,12 +2578,12 @@ final class DocxTextReplacerTests: XCTestCase {
     }
 
     func testCountsMatchesAcrossSplitRuns() throws {
-        let data = DocxFixture.docx(bodyXML: DocxFixture.paragraph(["北", "京", "公司"]))
+        let data = try DocxFixture.docx(bodyXML: DocxFixture.paragraph(["北", "京", "公司"]))
         XCTAssertEqual(try DocxTextReplacer.countMatches(docxData: data, find: "北京公司", options: options), 1)
     }
 
     func testReplaceKeepsStructureIdentical() throws {
-        let data = DocxFixture.docx(bodyXML: """
+        let data = try DocxFixture.docx(bodyXML: """
         <w:p><w:pPr><w:jc w:val="center"/></w:pPr>\
         <w:r><w:rPr><w:b/></w:rPr><w:t>北</w:t></w:r>\
         <w:r><w:t>京公司</w:t></w:r></w:p>
@@ -2394,7 +2598,7 @@ final class DocxTextReplacerTests: XCTestCase {
     }
 
     func testReplacementInheritsFirstRunFormatting() throws {
-        let data = DocxFixture.docx(bodyXML: """
+        let data = try DocxFixture.docx(bodyXML: """
         <w:p><w:r><w:rPr><w:b/></w:rPr><w:t>北</w:t></w:r><w:r><w:t>京</w:t></w:r></w:p>
         """)
         let (out, _) = try DocxTextReplacer.replace(docxData: data, find: "北京", replaceWith: "上海",
@@ -2411,7 +2615,7 @@ final class DocxTextReplacerTests: XCTestCase {
         <w:p><w:r><w:t>旧名</w:t></w:r></w:p>
         <w:p><w:r><w:drawing><w:txbxContent><w:p><w:r><w:t>旧名</w:t></w:r></w:p></w:txbxContent></w:drawing></w:r></w:p>
         """
-        let data = DocxFixture.docx(bodyXML: body, extraParts: [
+        let data = try DocxFixture.docx(bodyXML: body, extraParts: [
             ("word/header1.xml", header),
             ("word/footer1.xml", footer),
         ])
@@ -2428,19 +2632,19 @@ final class DocxTextReplacerTests: XCTestCase {
     }
 
     func testDoesNotMatchAcrossParagraphs() throws {
-        let data = DocxFixture.docx(bodyXML:
+        let data = try DocxFixture.docx(bodyXML:
             DocxFixture.paragraph(["北京"]) + DocxFixture.paragraph(["公司"]))
         XCTAssertEqual(try DocxTextReplacer.countMatches(docxData: data, find: "北京公司", options: options), 0)
     }
 
     func testDoesNotMatchAcrossLineBreak() throws {
-        let data = DocxFixture.docx(bodyXML:
+        let data = try DocxFixture.docx(bodyXML:
             "<w:p><w:r><w:t>北京</w:t></w:r><w:r><w:br/></w:r><w:r><w:t>公司</w:t></w:r></w:p>")
         XCTAssertEqual(try DocxTextReplacer.countMatches(docxData: data, find: "北京公司", options: options), 0)
     }
 
     func testNoMatchLeavesDataUntouched() throws {
-        let data = DocxFixture.docx(bodyXML: DocxFixture.paragraph(["内容"]))
+        let data = try DocxFixture.docx(bodyXML: DocxFixture.paragraph(["内容"]))
         let (out, count) = try DocxTextReplacer.replace(docxData: data, find: "不存在", replaceWith: "x",
                                                         options: options)
         XCTAssertEqual(count, 0)
@@ -2448,21 +2652,21 @@ final class DocxTextReplacerTests: XCTestCase {
     }
 
     func testEntitiesSurviveReplacement() throws {
-        let data = DocxFixture.docx(bodyXML: DocxFixture.paragraph(["a &amp; b"]))
+        let data = try DocxFixture.docx(bodyXML: DocxFixture.paragraph(["a &amp; b"]))
         let (out, _) = try DocxTextReplacer.replace(docxData: data, find: "& b", replaceWith: "<c>",
                                                     options: options)
         XCTAssertTrue(try documentText(out).contains("a &amp; &lt;c&gt;"))
     }
 
     func testSpacesAtEdgesGetPreserveSpace() throws {
-        let data = DocxFixture.docx(bodyXML: DocxFixture.paragraph(["X Y"]))
+        let data = try DocxFixture.docx(bodyXML: DocxFixture.paragraph(["X Y"]))
         let (out, _) = try DocxTextReplacer.replace(docxData: data, find: "X", replaceWith: " X ",
                                                     options: options)
         XCTAssertTrue(try documentText(out).contains("xml:space=\"preserve\""))
     }
 
     func testUntouchedEntriesAreByteIdentical() throws {
-        let data = DocxFixture.docx(bodyXML: DocxFixture.paragraph(["旧名"]))
+        let data = try DocxFixture.docx(bodyXML: DocxFixture.paragraph(["旧名"]))
         let before = try ZipArchive(data: data)
         let rawBefore = try before.rawData(of: try XCTUnwrap(before.entry(named: "_rels/.rels")))
         let (out, _) = try DocxTextReplacer.replace(docxData: data, find: "旧名", replaceWith: "新名",
@@ -2563,7 +2767,7 @@ enum DocxTextReplacer {
                 outputs.append(ZipWriter.copyEntry(entry, raw: try archive.rawData(of: entry)))
             }
         }
-        return (ZipWriter.build(outputs), total)
+        return (try ZipWriter.build(outputs), total)
     }
 }
 ```
