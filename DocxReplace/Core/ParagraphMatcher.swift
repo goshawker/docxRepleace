@@ -15,9 +15,20 @@ enum ParagraphMatcher {
         var newText: String
     }
 
-    /// 词字符集合：Unicode 字母（L*，含中日韩及扩展区）与十进制数字（Nd）。
-    /// 取舍：上标/罗马数字/分数（①Ⅷ½ 等 No/Nl 类）**不算**词字符。
-    private static let wordScalars = CharacterSet.letters.union(.decimalDigits)
+    /// 词字符 = Unicode 通用类别 L*（字母，含中日韩、扩展区、西夏文等）∪ Nd（十进制数字）。
+    ///
+    /// 不用 `CharacterSet.letters`：它实测是 L* ∪ M*（多含组合符号），
+    /// 且在本机缺少 6 227 个真实字母标量（西夏文 U+17000 起、Todhri U+105C0 起等），
+    /// 漏掉字母会把词内命中误判成整词命中，从而改错文字。
+    private static func isWordScalar(_ scalar: UnicodeScalar) -> Bool {
+        switch scalar.properties.generalCategory {
+        case .uppercaseLetter, .lowercaseLetter, .titlecaseLetter, .modifierLetter, .otherLetter,
+             .decimalNumber:
+            return true
+        default:
+            return false
+        }
+    }
 
     static func countMatches(in texts: [String], find: String, options: ReplaceOptions) -> Int {
         guard !find.isEmpty else { return 0 }
@@ -89,13 +100,13 @@ enum ParagraphMatcher {
     }
 
     /// 判断该 UTF-16 码元位置所在的**完整字符**是否为词字符。
-    /// 必须按组合字符序列判断，不能只看单个码元：非 BMP 字符（𝒜、𠀀）是代理对，
-    /// 孤立代理项不属于字母集，会被误判成词边界，从而把词内命中当成整词命中。
+    /// 必须按组合字符序列判断，不能只看单个码元：非 BMP 字符（𝒜、𗀀）是代理对，
+    /// 孤立代理项会被误判成词边界。
     private static func isWordCharacter(_ haystack: NSString, at index: Int) -> Bool {
         guard index >= 0, index < haystack.length else { return false }
         let sequence = haystack.rangeOfComposedCharacterSequence(at: index)
         guard let first = haystack.substring(with: sequence).unicodeScalars.first else { return false }
-        return wordScalars.contains(first)
+        return isWordScalar(first)
     }
 
     private static func isWholeWordMatch(_ haystack: NSString, _ found: NSRange) -> Bool {

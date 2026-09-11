@@ -170,4 +170,21 @@ final class ParagraphMatcherTests: XCTestCase {
         XCTAssertEqual(ParagraphMatcher.countMatches(in: ["1cat"], find: "cat", options: opts), 0)
         XCTAssertEqual(ParagraphMatcher.countMatches(in: ["①cat"], find: "cat", options: opts), 1)
     }
+
+    func testWholeWordIgnoresOrphanCombiningMark() {
+        // 孤立的组合符 / 变体选择符属于 M*，不是词字符
+        let opts = ReplaceOptions(caseSensitive: true, wholeWord: true)
+        XCTAssertEqual(ParagraphMatcher.countMatches(in: ["\u{0301}cat"], find: "cat", options: opts), 1)
+        XCTAssertEqual(ParagraphMatcher.countMatches(in: ["\u{FE0F}cat"], find: "cat", options: opts), 1)
+    }
+
+    func testWholeWordRecognizesLettersMissingFromCharacterSetLetters() {
+        // CharacterSet.letters 在本机缺少部分真实字母（西夏文、Todhri），
+        // 不修的话会被当成词边界，产生错误替换
+        let opts = ReplaceOptions(caseSensitive: true, wholeWord: true)
+        XCTAssertEqual(ParagraphMatcher.countMatches(in: ["\u{17000}cat"], find: "cat", options: opts), 0)
+        XCTAssertEqual(ParagraphMatcher.countMatches(in: ["\u{105C0}cat"], find: "cat", options: opts), 0)
+        XCTAssertTrue(ParagraphMatcher.replace(in: ["\u{17000}cat"], find: "cat", replaceWith: "X",
+                                               options: opts).isEmpty)
+    }
 }
