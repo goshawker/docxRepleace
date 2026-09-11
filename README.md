@@ -1,5 +1,7 @@
 # DocxReplace
 
+**中文 | [English](#english)**
+
 批量查找替换文件夹下所有 Word 文档（`.docx`）中的文字，**格式完全不变**。
 
 A macOS app that batch find/replaces text across every `.docx` in a folder, **preserving all formatting byte-for-byte**.
@@ -105,9 +107,16 @@ DocxReplace/
 
 ## 许可
 
-未指定。如需开源授权请自行添加 `LICENSE`。
+采用 [PolyForm Noncommercial License 1.0.0](LICENSE)。
+
+- ✅ **允许**：个人学习、研究、实验、业余项目；慈善机构、教育机构、公共研究机构、公共安全与卫生机构、环保组织、政府机构等非商业组织使用
+- ❌ **禁止**：任何商业用途（包括在公司内部用于商业经营、打包进商业产品或服务、提供付费服务等）
+
+如需商业授权，请联系作者。
 
 ---
+
+<a id="english"></a>
 
 ## English
 
@@ -122,3 +131,12 @@ DocxReplace/
 Requires macOS 14.0+. Universal binary (Intel + Apple Silicon). First launch may be blocked by Gatekeeper (ad-hoc signed, not notarized) — right-click the app → Open.
 
 Not supported: `.doc`, matches spanning paragraphs or manual line breaks, and editing field codes or tracked-change deletions.
+
+### License
+
+Licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE).
+
+- ✅ **Permitted**: personal study, research, experiment, hobby projects; and use by charitable organizations, educational institutions, public research organizations, public safety or health organizations, environmental protection organizations, and government institutions.
+- ❌ **Not permitted**: any commercial purpose — including internal business use, bundling into a commercial product or service, or offering it as a paid service.
+
+For commercial licensing, please contact the author.
