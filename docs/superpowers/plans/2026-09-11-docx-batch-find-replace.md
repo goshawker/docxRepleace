@@ -714,6 +714,21 @@ final class ZipCompressionTests: XCTestCase {
         let garbage = Data([0x01, 0x02, 0x03, 0x04, 0x05])
         XCTAssertNil(ZipCompression.inflate(garbage, expectedSize: 100))
     }
+
+    func testInflateRecoversWhenExpectedSizeTooSmall() throws {
+        // compression_decode_buffer 在缓冲区不足时返回已解出的字节数（截断）而非报错，
+        // 因此 must 靠「未填满缓冲区」判定成功，并自动扩容重试
+        let original = Data(String(repeating: "截断风险 abcdefg ", count: 500).utf8)
+        let deflated = try XCTUnwrap(ZipCompression.deflate(original))
+        let inflated = try XCTUnwrap(ZipCompression.inflate(deflated, expectedSize: original.count / 2))
+        XCTAssertEqual(inflated, original)
+    }
+
+    func testInflateAcceptsOversizedExpectedSize() throws {
+        let original = Data(String(repeating: "hello 你好 ", count: 300).utf8)
+        let deflated = try XCTUnwrap(ZipCompression.deflate(original))
+        XCTAssertEqual(ZipCompression.inflate(deflated, expectedSize: original.count * 2), original)
+    }
 }
 ```
 
@@ -776,11 +791,15 @@ enum ZipCompression {
         return output
     }
 
-    /// raw DEFLATE 解压。expectedSize 来自 ZIP 中央目录
+    /// raw DEFLATE 解压。expectedSize 来自 ZIP 中央目录。
+    ///
+    /// 关键：`compression_decode_buffer` 在缓冲区不足时**不报错**，而是返回已解出的
+    /// 字节数（即截断）。因此初始容量取 `expectedSize + 1`，并且只接受「未填满缓冲区」
+    /// 的结果——否则会把截断的数据当作完整结果返回。
     static func inflate(_ data: Data, expectedSize: Int) -> Data? {
         guard !data.isEmpty else { return expectedSize == 0 ? Data() : nil }
         guard expectedSize > 0 else { return nil }
-        var capacity = expectedSize
+        var capacity = expectedSize + 1
         for _ in 0..<5 {
             var output = Data(count: capacity)
             let written = output.withUnsafeMutableBytes { dst -> Int in
@@ -790,11 +809,9 @@ enum ZipCompression {
                     return compression_decode_buffer(dstBase, capacity, srcBase, data.count, nil, COMPRESSION_ZLIB)
                 }
             }
-            if written > 0 {
-                if written < capacity || written == expectedSize {
-                    output.removeSubrange(written...)
-                    return output
-                }
+            if written > 0, written < capacity {
+                output.removeSubrange(written...)
+                return output
             }
             capacity = capacity * 4 + 64
         }
@@ -810,7 +827,7 @@ cd /Users/LB/Documents/AIProjects/DocxRepleace
 xcodebuild -project DocxReplace.xcodeproj -scheme DocxReplace -destination 'platform=macOS' test -only-testing:DocxReplaceTests/ZipCompressionTests 2>&1 | tail -20
 ```
 
-Expected: `** TEST SUCCEEDED **`，5 个测试全部通过。
+Expected: `** TEST SUCCEEDED **`，7 个测试全部通过。
 
 若 `testInflateRejectsGarbage` 意外通过解码（返回非 nil），删除该断言改成「解码结果不等于原始垃圾数据」的断言即可——不同系统的 Compression 实现对垃圾输入容忍度不同，这不是本项目的关键行为。
 
