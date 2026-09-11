@@ -9,3 +9,6 @@ xcuserdata/
 *.dSYM.zip
 *.dSYM
 *.xcresult
+
+# 打包产物
+dist/
