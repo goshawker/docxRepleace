@@ -7,6 +7,8 @@ enum ZipError: Error, Equatable {
     case encryptedEntry(String)
     case corruptEntry(String)
     case crcMismatch(String)
+    case implausibleSize(String)
+    case archiveTooLarge
 
     var message: String {
         switch self {
@@ -16,6 +18,8 @@ enum ZipError: Error, Equatable {
         case .encryptedEntry(let name): return "文档已加密，无法读取（\(name)）"
         case .corruptEntry(let name): return "文件结构损坏（\(name)）"
         case .crcMismatch(let name): return "数据校验失败（\(name)）"
+        case .implausibleSize(let name): return "部件尺寸异常，已跳过（\(name)）"
+        case .archiveTooLarge: return "文档过大，超出 ZIP 格式上限"
         }
     }
 }
@@ -127,6 +131,9 @@ struct ZipArchive {
         case 0:
             out = raw
         case 8:
+            guard Int(entry.uncompressedSize) <= Self.inflateLimit(compressedSize: entry.compressedSize) else {
+                throw ZipError.implausibleSize(entry.name)
+            }
             guard let inflated = ZipCompression.inflate(raw, expectedSize: Int(entry.uncompressedSize)) else {
                 throw ZipError.corruptEntry(entry.name)
             }
@@ -138,6 +145,12 @@ struct ZipArchive {
             throw ZipError.crcMismatch(entry.name)
         }
         return out
+    }
+
+    /// 解压尺寸上限：至少 64 MiB，或压缩数据的 256 倍。
+    /// 防止损坏或恶意的 uncompressedSize 触发失控的内存分配。
+    private static func inflateLimit(compressedSize: UInt32) -> Int {
+        max(64 * 1024 * 1024, Int(compressedSize) * 256)
     }
 
     static func readU16(_ b: [UInt8], _ o: Int) -> UInt16 {
