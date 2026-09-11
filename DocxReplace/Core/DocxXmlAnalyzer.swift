@@ -1,0 +1,99 @@
+import Foundation
+
+enum DocxXmlError: Error, Equatable {
+    case parseFailed(String)
+    case nodeCountMismatch(dom: Int, raw: Int)
+
+    var message: String {
+        switch self {
+        case .parseFailed(let detail): return "XML 解析失败：\(detail)"
+        case .nodeCountMismatch(let dom, let raw): return "文档结构异常（DOM \(dom) / 原始 \(raw)）"
+        }
+    }
+}
+
+/// 用 XMLDocument 解析出段落结构，解决两件事：
+/// 1. 哪些 w:t 属于同一个段落（决定能否跨 run 匹配）
+/// 2. 段落内的换行/制表符把文字切成多个片段（匹配不跨片段）
+enum DocxXmlAnalyzer {
+    struct PartAnalysis: Equatable {
+        /// 每个片段包含的 w:t 全局序号
+        var segments: [[Int]]
+        /// 每个 w:t 的文字（下标即全局序号）
+        var texts: [String]
+    }
+
+    static func analyze(_ xml: [UInt8]) throws -> PartAnalysis {
+        let document: XMLDocument
+        do {
+            document = try XMLDocument(data: Data(xml), options: [])
+        } catch {
+            throw DocxXmlError.parseFailed(String(describing: error))
+        }
+
+        var textNodes: [XMLNode] = []
+        var indexByNode: [ObjectIdentifier: Int] = [:]
+        func collect(_ node: XMLNode) {
+            if node.kind == .element, node.name == "w:t" {
+                indexByNode[ObjectIdentifier(node)] = textNodes.count
+                textNodes.append(node)
+            }
+            for child in node.children ?? [] {
+                collect(child)
+            }
+        }
+        if let root = document.rootElement() {
+            collect(root)
+        }
+
+        let rawNodes = XmlTextLocator.findTextNodes(in: xml)
+        guard rawNodes.count == textNodes.count else {
+            throw DocxXmlError.nodeCountMismatch(dom: textNodes.count, raw: rawNodes.count)
+        }
+
+        var segments: [[Int]] = []
+        func walkParagraph(_ paragraph: XMLNode) {
+            var current: [Int] = []
+            func visit(_ node: XMLNode) {
+                guard node.kind == .element else { return }
+                if node.name == "w:p", node !== paragraph { return }   // 嵌套段落（文本框）单独处理
+                if node.name == "w:t" {
+                    if let index = indexByNode[ObjectIdentifier(node)] {
+                        current.append(index)
+                    }
+                    return
+                }
+                if node.name == "w:br" || node.name == "w:tab" || node.name == "w:cr" {
+                    if !current.isEmpty {
+                        segments.append(current)
+                        current = []
+                    }
+                    return
+                }
+                for child in node.children ?? [] {
+                    visit(child)
+                }
+            }
+            visit(paragraph)
+            if !current.isEmpty {
+                segments.append(current)
+            }
+        }
+
+        func collectParagraphs(_ node: XMLNode) {
+            if node.kind == .element, node.name == "w:p" {
+                walkParagraph(node)
+                // 继续下钻：walkParagraph 已跳过嵌套 w:p 的子树，
+                // 这里负责把它们（文本框等）当作独立段落再走一遍
+            }
+            for child in node.children ?? [] {
+                collectParagraphs(child)
+            }
+        }
+        if let root = document.rootElement() {
+            collectParagraphs(root)
+        }
+
+        return PartAnalysis(segments: segments, texts: rawNodes.map(\.text))
+    }
+}
