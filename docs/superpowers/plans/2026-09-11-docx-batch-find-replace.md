@@ -2073,6 +2073,169 @@ git commit -m "feat: w:t 文字改写，含 xml:space 补写与实体转义；�
 
 ---
 
+## Task 6b: `rebuild` 接口加固（Task 6 代码审查结论）
+
+**Files:**
+- Modify: `DocxReplace/Core/XmlTextLocator.swift`
+- Modify: `DocxReplaceTests/XmlTextLocatorTests.swift`
+
+背景：审查确认当前实现不会损坏文档，但发现四处「静默出错」的可能。它们在 Task 10 依赖 `rebuild` 之前修最便宜。
+
+- **序号越界被静默丢弃**：`rebuild` 用 `compactMap` 丢掉越界序号却不告诉调用方。一旦序号错位，会「只改了一部分，却按全部成功上报」——正是本项目最不能接受的静默错误。
+- **`escape` 不处理 `\r`**：XML 解析器会把裸 `\r` 规范化为 `\n`，替换文字的语义会悄悄改变。
+- **`xml:space="default"` 会写出重复属性**：检测逻辑只认 `preserve`，遇到 `default` 会再追加一个 `xml:space`，结果是 `XMLDocument` 拒绝的非法 XML。
+- **首尾空白判断用的是 `Character`**：`" " + U+0301`（空格后跟组合字符）会被当成一个字素簇，导致漏写 `xml:space="preserve"`，Word 可能吃掉前导空格。
+
+**Step 1: 追加失败测试到 `XmlTextLocatorTests.swift`**
+
+```swift
+    func testRebuildReportsAppliedCountAndDropsBadKeys() {
+        let xml = "<w:t>a</w:t><w:t>b</w:t>"
+        let result = XmlTextLocator.rebuild(xml: [UInt8](xml.utf8), edits: [0: "X", 99: "Y", -1: "Z"])
+        XCTAssertEqual(result.applied, 1)
+        XCTAssertEqual(String(decoding: result.xml, as: UTF8.self), "<w:t>X</w:t><w:t>b</w:t>")
+    }
+
+    func testRebuildPreservesOtherAttributesOnEditedElement() {
+        let out = rebuild("<w:t w:rsidR=\"00AB12\">旧</w:t>", edits: [0: "新"])
+        XCTAssertEqual(out, "<w:t w:rsidR=\"00AB12\">新</w:t>")
+    }
+
+    func testRebuildSelfClosingWithExistingAttribute() {
+        let out = rebuild("<w:t xml:space=\"preserve\"/>", edits: [0: " x"])
+        XCTAssertEqual(out, "<w:t xml:space=\"preserve\"> x</w:t>")
+    }
+
+    func testRebuildDoesNotDuplicateExplicitDefaultSpace() {
+        let out = rebuild("<w:t xml:space=\"default\">abc</w:t>", edits: [0: " abc "])
+        XCTAssertEqual(out, "<w:t xml:space=\"default\"> abc </w:t>")
+    }
+
+    func testRebuildEscapesCarriageReturn() {
+        XCTAssertEqual(rebuild("<w:t>x</w:t>", edits: [0: "a\rb"]), "<w:t>a&#13;b</w:t>")
+    }
+
+    func testLeadingSpaceBeforeCombiningMarkGetsPreserve() {
+        // 前导空格后紧跟组合字符：按 Character 判断会误判，必须按 UnicodeScalar
+        let out = rebuild("<w:t>x</w:t>", edits: [0: " \u{0301}abc"])
+        XCTAssertEqual(out, "<w:t xml:space=\"preserve\"> \u{0301}abc</w:t>")
+    }
+```
+
+注意：类内的 `private func rebuild(_:edits:) -> String` 辅助方法要适配新的返回类型（取 `.xml`）。
+
+**Step 2: 运行测试确认失败**
+
+```bash
+cd /Users/LB/Documents/AIProjects/DocxRepleace
+xcodebuild -project DocxReplace.xcodeproj -scheme DocxReplace -destination 'platform=macOS' test -only-testing:DocxReplaceTests/XmlTextLocatorTests 2>&1 | tail -20
+```
+
+**Step 3: 改 `DocxReplace/Core/XmlTextLocator.swift`**
+
+（a）`rebuild` 返回已应用数量，并在文档注释里写明序号不变量：
+
+```swift
+    /// 按 w:t 的出现序号应用新文字，返回新的 XML 字节与**实际应用**的编辑数。
+    /// 只重建被编辑的 `w:t` 元素，其余字节原样拼接。
+    ///
+    /// 序号不变量：序号 i 表示文档顺序中的第 i 个 `w:t`。调用方必须按同样的文档顺序枚举，
+    /// 否则会改错元素。调用方还应断言 `applied == edits.count`（越界序号会被丢弃，不报错）。
+    static func rebuild(xml: [UInt8], edits: [Int: String]) -> (xml: [UInt8], applied: Int) {
+        guard !edits.isEmpty else { return (xml, 0) }
+        let nodes = findTextNodes(in: xml)
+        let targets: [(node: TextNode, newText: String)] = edits
+            .compactMap { index, newText in
+                guard index >= 0, index < nodes.count else { return nil }
+                return (nodes[index], newText)
+            }
+            .sorted { $0.node.elementStart < $1.node.elementStart }
+
+        var out = Data()
+        var cursor = 0
+        for target in targets {
+            guard target.node.elementStart >= cursor else { continue }
+            out.append(contentsOf: xml[cursor..<target.node.elementStart])
+            var attributes = target.node.attributes
+            if needsPreserveSpace(target.newText), !target.node.hasSpaceAttribute {
+                attributes += " xml:space=\"preserve\""
+            }
+            out.append(contentsOf: Array("<w:t\(attributes)>\(escape(target.newText))</w:t>".utf8))
+            cursor = target.node.elementEnd
+        }
+        out.append(contentsOf: xml[cursor...])
+        return ([UInt8](out), targets.count)
+    }
+```
+
+（b）`TextNode.hasPreserveSpace` 改名为 `hasSpaceAttribute`，语义变为「开标签里存在 `xml:space` 属性」：
+
+```swift
+        var hasSpaceAttribute: Bool   // 开标签里存在 xml:space 属性（任何取值）
+```
+
+`findTextNodes` 中对应判断改为：
+
+```swift
+            let hasSpace = attributes.contains("xml:space")
+```
+
+同时把已有的 `testDetectsPreserveSpaceAttribute` 里的字段名一并改掉（断言值不变）。
+
+（c）`escape` 增加 `\r`：
+
+```swift
+            case "\r": out += "&#13;"
+```
+
+（d）首尾空白按 UnicodeScalar 判断：
+
+```swift
+    private static func needsPreserveSpace(_ text: String) -> Bool {
+        guard let first = text.unicodeScalars.first, let last = text.unicodeScalars.last else { return false }
+        return isSpaceScalar(first) || isSpaceScalar(last)
+    }
+
+    // 注意：NBSP(U+00A0) 不算空白 —— Word 不会裁剪它，加 preserve 反而多余
+    private static func isSpaceScalar(_ s: UnicodeScalar) -> Bool {
+        s == " " || s == "\t" || s == "\n" || s == "\r"
+    }
+```
+
+（e）把重复出现 4 次的 CDATA 字面量与模式串提成 `private static let`（审查实测可省一半扫描时间）：
+
+```swift
+    private static let cdataOpen = [UInt8]("<![CDATA[".utf8])
+    private static let cdataClose = [UInt8]("]]>".utf8)
+    private static let textOpen = [UInt8]("<w:t".utf8)
+    private static let textClose = [UInt8]("</w:t".utf8)
+    private static let commentOpen = [UInt8]("<!--".utf8)
+    private static let commentClose = [UInt8]("-->".utf8)
+    private static let piOpen = [UInt8]("<?".utf8)
+    private static let piClose = [UInt8]("?>".utf8)
+```
+
+并给 `matches`/`find` 增加接受 `[UInt8]` 模式的重载，调用点改用模式数组（保留接受 `String` 的版本以免大改，但热路径用数组）。若这一步让改动面失控，可以只做 (a)–(d)，把 (e) 留到 Task 15 的收尾优化。
+
+**Step 4: 运行测试确认通过**
+
+```bash
+cd /Users/LB/Documents/AIProjects/DocxRepleace
+xcodebuild -project DocxReplace.xcodeproj -scheme DocxReplace -destination 'platform=macOS' test 2>&1 | tail -20
+```
+
+Expected: `** TEST SUCCEEDED **`，全量 50 个测试通过（44 + 6 新增）。
+
+**Step 5: 提交**
+
+```bash
+cd /Users/LB/Documents/AIProjects/DocxRepleace
+git add DocxReplace/Core/XmlTextLocator.swift DocxReplaceTests/XmlTextLocatorTests.swift
+git commit -m "fix: rebuild 返回实际应用数、修 xml:space 重复属性与首尾空白误判"
+```
+
+---
+
 ## Task 7: 纯文本查找与计数
 
 **Files:**
@@ -2429,6 +2592,24 @@ final class DocxXmlAnalyzerTests: XCTestCase {
 
     func testMalformedXMLErrors() {
         XCTAssertThrowsError(try analyze("<w:p><w:r><w:t>未闭合"))
+    }
+
+    /// 最关键的假设：字节扫描顺序与 DOM 遍历顺序逐位对应。
+    /// 用带注释、delText、文本框嵌套段落的夹具钉死它。
+    func testTextsMatchRawScanOrder() throws {
+        let xml = """
+        <w:p><w:r><w:t>一</w:t></w:r><!-- <w:t>注释</w:t> --><w:r><w:t>二</w:t></w:r></w:p>
+        <w:p><w:del><w:r><w:delText>已删</w:delText></w:r></w:del><w:r><w:t>三</w:t></w:r></w:p>
+        <w:p><w:r><w:t>四</w:t></w:r><w:r><w:drawing><w:txbxContent>
+        <w:p><w:r><w:t>五</w:t></w:r></w:p>
+        </w:txbxContent></w:drawing></w:r></w:p>
+        """
+        let wrapped = "<w:doc xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">"
+            + xml + "</w:doc>"
+        let bytes = [UInt8](wrapped.utf8)
+        let analysis = try DocxXmlAnalyzer.analyze(bytes)
+        XCTAssertEqual(analysis.texts, XmlTextLocator.findTextNodes(in: bytes).map(\.text))
+        XCTAssertEqual(analysis.texts, ["一", "二", "三", "四", "五"])
     }
 }
 ```
@@ -2912,7 +3093,13 @@ enum DocxTextReplacer {
         var total = 0
         for entry in archive.entries {
             if let changed = partEdits[entry.name] {
-                let newXML = XmlTextLocator.rebuild(xml: changed.xml, edits: changed.edits)
+                let rebuilt = XmlTextLocator.rebuild(xml: changed.xml, edits: changed.edits)
+                // 序号必须全部命中：rebuild 会静默丢弃越界序号，宁可整份文件报错，
+                // 也不能出现「只改了一部分却按全部成功上报」
+                guard rebuilt.applied == changed.edits.count else {
+                    throw DocxXmlError.nodeCountMismatch(dom: rebuilt.applied, raw: changed.edits.count)
+                }
+                let newXML = rebuilt.xml
                 // 最后一道防线：改写后的 XML 必须仍能被完整解析。
                 // 宁可整份文件报错跳过，也不能写出 Word 打不开的文档。
                 _ = try XMLDocument(data: Data(newXML), options: [])
@@ -3637,7 +3824,17 @@ final class AppViewModel: ObservableObject {
         if findText.isEmpty { return "请输入要查找的内容" }
         if findText.contains("\n") || findText.contains("\r") { return "查找内容不能包含换行符" }
         if replaceText.contains("\n") || replaceText.contains("\r") { return "替换内容不能包含换行符" }
+        if Self.hasIllegalControlCharacter(findText) { return "查找内容包含无法写入文档的控制字符" }
+        if Self.hasIllegalControlCharacter(replaceText) { return "替换内容包含无法写入文档的控制字符" }
         return nil
+    }
+
+    /// XML 1.0 不允许 C0 控制字符（\t 除外）与 U+FFFE/U+FFFF。
+    /// 它们无法被转义成合法 XML，粘贴进来的话会让整份文件写出后无法解析。
+    private static func hasIllegalControlCharacter(_ text: String) -> Bool {
+        text.unicodeScalars.contains {
+            ($0.value < 0x20 && $0 != "\t") || $0.value == 0xFFFE || $0.value == 0xFFFF
+        }
     }
 
     var isBusy: Bool { phase == .scanning || phase == .replacing }
@@ -3998,6 +4195,10 @@ Expected: `** TEST SUCCEEDED **`。
 4. 查找不存在的词 → 状态栏「没有找到匹配内容」，「全部替换」按钮不可点
 5. 查找内容里粘贴换行 → 出现「查找内容不能包含换行符」，按钮不可点
 6. 备份开关关闭后再替换 → 「打开备份文件夹」按钮不出现
+7. 粘贴含控制字符的内容（如 U+000B）→ 出现「包含无法写入文档的控制字符」，按钮不可点
+8. 含图形/文本框的文档（Word 用 `mc:AlternateContent` 同时保存现代与兼容两套表示）→
+   两套表示都会被替换，**命中计数可能大于肉眼可见的处数**，这是预期行为（保证两套表示一致），
+   用 Word 打开确认显示结果正确即可
 
 - [ ] **Step 3: 用真实 Word 文档验证格式**
 
